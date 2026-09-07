@@ -1,0 +1,175 @@
+# 知行量化系统配置
+#
+# 注意：原文件里 timing 和 portfolio 各出现过两次，YAML 后者覆盖前者，
+# 前面那份是死配置（改了不生效）。本文件已合并去重，只保留实际生效的值。
+
+# ---------------------------------------------------------------------------
+# 数据源：本地通达信文件（不再走 MCP / 付费接口）
+# ---------------------------------------------------------------------------
+data:
+  # 通达信安装目录，脚本会自动找它下面的 vipdoc
+  # Windows 例: C:/new_tdx        Mac(Wine/CrossOver) 例: /Users/you/tdx
+  tdx_install_dir: E:/Programs/tdx
+  db_path: data/market.db
+  markets: [sh, sz]
+  include_bj: false          # 北交所，需要的话改 true 并把 bj 加进 markets
+
+capital:
+  initial_cash: 50000
+  max_position_value: 25000
+
+universe:
+  min_daily_amount: 100000000    # 成交额下限，1 亿
+  exclude_st: true
+  exclude_new_stock_days: 60     # K线数少于此值视为次新，剔除
+  exclude_boards: []             # 可填 STAR / CHINEXT / BSE，INDEX 永远排除
+  max_candidates: 10
+
+execution:
+  signal_confirm: close
+  entry_price: next_open
+  abandon_gap_up: 0.07
+  t_plus_1: true
+
+regime:
+  current: BEAR
+  block_open_in_bear: false
+
+report:
+  lookback_bars: 120
+
+# ---------------------------------------------------------------------------
+# 指标参数
+# ---------------------------------------------------------------------------
+brick:
+  n1: 4
+  n2: 6
+  yellow_ma_windows: [14, 28, 57, 114]
+  min_height_ratio: 0.6666666667
+  take_profit:
+    red_streak_2: 0.10
+    red_streak_3: 0.30
+    red_streak_4: 0.50
+  stop_loss:
+    break_entry_low: true
+    break_yellow_line: true
+
+b1:
+  yellow_ma_windows: [14, 28, 57, 114]
+  rsi_n: 9
+  j_threshold: 13
+  chg_min: -4
+  chg_max: 4
+
+b2:
+  yellow_ma_windows: [14, 28, 57, 114]
+  rsi_n: 9
+  exist_window: 3
+  j_oversold: 13
+  chg_min: 3.95
+  j_threshold: 55
+
+macd:
+  fast: 12
+  slow: 26
+  signal: 9
+  divergence_window: 60
+
+volume_price:
+  vol_ma_window: 5
+
+key_kline:
+  atr_window: 14
+  lookback: 60
+
+dual_line:
+  fast: 10
+  slow: 20
+
+single_needle:
+  n1: 10
+  n2: 20
+
+sell:
+  s1_double_vol_threshold: 2.0
+  s2_white_break: true
+  s3_big_bear_body_min: 0.6
+  s3_gap_down_pct: 0.02
+
+distribution:
+  high_vol_multiplier: 1.8
+  sky_vol_multiplier: 2.0
+  near_high_pct: 0.97
+
+# ---------------------------------------------------------------------------
+# 择时（原文件重复两次，此处为合并后生效的一份）
+# ---------------------------------------------------------------------------
+timing:
+  proxy_weights:
+    northbound: 0.25
+    turnover_change: 0.20
+    main_force: 0.20
+    margin: 0.10
+    advance_decline: 0.10
+    chi_next_sh: 0.10
+    new_high_ratio: 0.05
+  bull_threshold: 0.65
+  bear_threshold: 0.35
+  bull_days: 3
+  bear_days: 3
+  neutral_bull_days: 3
+  neutral_bear_days: 2
+
+# ---------------------------------------------------------------------------
+# 仓位（原文件重复两次，此处为合并后生效的一份）
+# ---------------------------------------------------------------------------
+portfolio:
+  risk_per_trade: 0.02
+  kelly_fraction: 0.25
+  bull_max_total: 0.80
+  neutral_max_total: 0.50
+  bear_max_total: 0.0
+  per_position_pct:
+    small_capital: 0.50
+    medium_new: 0.10
+    medium_expert: 0.20
+    large: 0.07
+  star_market_haircut: 0.5
+
+# ---------------------------------------------------------------------------
+# 回测
+# ---------------------------------------------------------------------------
+backtest:
+  initial_capital: 500000
+  commission: 0.00025        # 佣金率
+  commission_min: 5          # 最低佣金 5 元
+  stamp_tax: 0.001           # 印花税，仅卖出
+  transfer_fee: 0.00001      # 过户费
+  slippage: 0.0015           # 滑点
+  limit_up_pct: 0.10         # 主板涨跌停
+  limit_up_chi_next: 0.20    # 创业板
+  limit_up_star: 0.20        # 科创板
+  max_positions: 5
+  max_holding_days: 20
+  max_entries_per_day: 2
+
+strategies:
+  brick:
+    take_profit:
+      red_streak_2: 0.10
+      red_streak_3: 0.30
+      red_streak_4: 0.50
+    stop_loss:
+      break_entry_low: true
+      break_yellow_line: true
+  b2:
+    modes:
+      - parallel_heavy_cannon
+      - post_disaster
+      - eager_to_try
+  yoga_pants:
+    allow_b3_addon: true
+
+executor:
+  max_open_per_day: 1
+  pre_order_check: true

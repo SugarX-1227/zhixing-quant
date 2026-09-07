@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# 本地行情库（可由通达信文件重建）
+# 注意：必须写成 /data/ 而不是 data/。
+# data/ 会匹配任意层级的 data 目录，把 zhixing_quant/data/ 源码也一起忽略掉，
+# 这就是之前整个数据访问层没能提交进仓库的原因。
+/data/
+
+# 旧版 HTML 报告，已由 Web 服务取代
+/reports/
+
+# macOS / IDE
+.DS_Store
+.idea/
+.vscode/

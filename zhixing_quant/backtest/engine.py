@@ -1,0 +1,411 @@
+"""事件驱动回测引擎。
+
+相比旧版修掉的问题：
+1. 旧版没有 import pandas，run() 一调用就 NameError —— 所以它从来没被跑通过。
+2. 旧版买入只扣手续费不扣本金（equity -= cost，cost 只是佣金），
+   资金曲线完全失真，收益率无意义。
+3. 旧版在日期循环里对每只股票重新调用 get_data_fn，
+   复杂度是 O(交易日 × 股票数) 次数据库查询，几百只股票要跑几小时。
+4. 旧版用当日收盘价成交，而信号本身就是收盘后才产生的 —— 未来函数。
+   现在统一为「T 日收盘出信号，T+1 开盘成交」，和 config.execution 一致。
+5. 旧版硬编码 sig_b1，换策略就失效。
+
+现在的口径：
+- 信号在 T 日收盘确认，T+1 开盘按 open ± 滑点成交。
+- T+1 开盘一字涨停买不进，一字跌停卖不出（顺延到下一日）。
+- A 股 T+1：当日买入当日不可卖。
+- 资金曲线 = 现金 + 持仓按当日收盘市值。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Sequence
+
+import numpy as np
+import pandas as pd
+
+from zhixing_quant.backtest.metrics import compute_metrics
+
+
+@dataclass
+class Trade:
+    code: str
+    entry_date: str
+    exit_date: str
+    entry_price: float
+    exit_price: float
+    shares: int
+    pnl: float
+    return_pct: float
+    exit_reason: str
+    holding_days: int
+
+
+@dataclass
+class Position:
+    code: str
+    entry_date: str
+    entry_price: float
+    shares: int
+    cost_basis: float          # 含买入费用的总成本
+    stop_loss: float
+    take_profit: float
+    bars_held: int = 0
+
+
+@dataclass
+class BacktestResult:
+    trades: List[Trade] = field(default_factory=list)
+    equity_curve: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
+    metrics: dict = field(default_factory=dict)
+    daily_positions: List[dict] = field(default_factory=list)
+
+    def trades_frame(self) -> pd.DataFrame:
+        if not self.trades:
+            return pd.DataFrame(
+                columns=[
+                    "code", "entry_date", "exit_date", "entry_price", "exit_price",
+                    "shares", "pnl", "return_pct", "exit_reason", "holding_days",
+                ]
+            )
+        return pd.DataFrame([t.__dict__ for t in self.trades])
+
+
+class BacktestEngine:
+    """A 股日线回测引擎。"""
+
+    def __init__(self, cfg: dict):
+        bt = cfg.get("backtest", {})
+        self.cfg = cfg
+        self.initial_capital = float(bt.get("initial_capital", 500000))
+        self.commission = float(bt.get("commission", 0.00025))
+        self.commission_min = float(bt.get("commission_min", 5.0))
+        self.stamp_tax = float(bt.get("stamp_tax", 0.001))
+        self.transfer_fee = float(bt.get("transfer_fee", 0.00001))
+        self.slippage = float(bt.get("slippage", 0.0015))
+        self.max_positions = int(bt.get("max_positions", 5))
+        self.max_holding_days = int(bt.get("max_holding_days", 20))
+        self.max_entries_per_day = int(bt.get("max_entries_per_day", 2))
+
+        ex = cfg.get("execution", {})
+        self.abandon_gap_up = float(ex.get("abandon_gap_up", 0.07))
+
+    # -- 主循环 -----------------------------------------------------------
+
+    def run(
+        self,
+        price_data: Dict[str, pd.DataFrame],
+        signal_col: str = "sig_brick",
+        stop_col: str = "stop_loss",
+        take_profit_pct: float = 0.15,
+        exit_fn: Optional[Callable] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> BacktestResult:
+        """跑一次回测。
+
+        Args:
+            price_data: {code: DataFrame}，必须已经算好指标，含 signal_col。
+                        索引为 DatetimeIndex，含 open/high/low/close。
+            signal_col: 买入信号列名，True 即当日收盘触发。
+            stop_col: 止损价列名，缺失时用当日 low。
+            take_profit_pct: 止盈比例。
+            exit_fn: 可选自定义卖出判断 (df, idx, position) -> Optional[str]，
+                     返回卖出原因字符串表示卖出。
+            start_date / end_date: YYYYMMDD。
+
+        Returns:
+            BacktestResult
+        """
+        if not price_data:
+            return BacktestResult(metrics=compute_metrics([], []))
+
+        prepared = self._prepare(price_data, signal_col, stop_col, start_date, end_date)
+        if not prepared:
+            return BacktestResult(metrics=compute_metrics([], []))
+
+        calendar = self._build_calendar(prepared)
+        if len(calendar) < 2:
+            return BacktestResult(metrics=compute_metrics([], []))
+
+        cash = self.initial_capital
+        positions: Dict[str, Position] = {}
+        trades: List[Trade] = []
+        equity_values: List[float] = []
+        daily_positions: List[dict] = []
+        pending_entries: List[dict] = []      # T 日收盘产生，T+1 开盘执行
+        pending_exits: List[str] = []
+
+        for day_i, date in enumerate(calendar):
+            date_str = date.strftime("%Y-%m-%d")
+
+            # --- 1. 开盘：先卖后买 ---
+            for code in list(pending_exits):
+                pos = positions.get(code)
+                bar = self._bar(prepared, code, date)
+                if pos is None or bar is None:
+                    pending_exits.remove(code)
+                    continue
+                if self._is_limit_down_open(prepared, code, date):
+                    continue          # 一字跌停卖不出，明天继续挂
+                price = self._fill_price(bar["open"], "SELL")
+                proceeds, fee = self._sell_proceeds(price, pos.shares)
+                cash += proceeds
+                pnl = proceeds - pos.cost_basis
+                trades.append(
+                    Trade(
+                        code=code,
+                        entry_date=pos.entry_date,
+                        exit_date=date_str,
+                        entry_price=pos.entry_price,
+                        exit_price=price,
+                        shares=pos.shares,
+                        pnl=round(pnl, 2),
+                        return_pct=pnl / pos.cost_basis if pos.cost_basis > 0 else 0.0,
+                        exit_reason=pos.__dict__.pop("_exit_reason", "signal"),
+                        holding_days=pos.bars_held,
+                    )
+                )
+                del positions[code]
+                pending_exits.remove(code)
+
+            for order in list(pending_entries):
+                code = order["code"]
+                if code in positions or len(positions) >= self.max_positions:
+                    continue
+                bar = self._bar(prepared, code, date)
+                if bar is None:
+                    continue
+                # 高开放弃：开盘价较信号日收盘高开超过阈值就不追
+                if bar["open"] >= order["signal_close"] * (1 + self.abandon_gap_up):
+                    continue
+                if self._is_limit_up_open(prepared, code, date):
+                    continue          # 一字涨停买不进
+                price = self._fill_price(bar["open"], "BUY")
+                budget = self._position_budget(cash, positions, price)
+                shares = int(budget // (price * 100)) * 100      # A 股 100 股整手
+                if shares <= 0:
+                    continue
+                cost, _ = self._buy_cost(price, shares)
+                if cost > cash:
+                    continue
+                cash -= cost
+                stop = order["stop"] if order["stop"] > 0 else bar["low"] * 0.97
+                positions[code] = Position(
+                    code=code,
+                    entry_date=date_str,
+                    entry_price=price,
+                    shares=shares,
+                    cost_basis=cost,
+                    stop_loss=min(stop, price * 0.99),
+                    take_profit=price * (1 + take_profit_pct),
+                )
+            pending_entries = []
+
+            # --- 2. 盘中：检查止损止盈（用当日 high/low 判定，成交价保守取触发价）---
+            for code, pos in list(positions.items()):
+                bar = self._bar(prepared, code, date)
+                if bar is None:
+                    continue
+                if pos.entry_date == date_str:
+                    continue                       # T+1，当日买入不可卖
+                hit, price, reason = self._intraday_exit(bar, pos)
+                if not hit:
+                    continue
+                fill = self._fill_price(price, "SELL")
+                proceeds, _ = self._sell_proceeds(fill, pos.shares)
+                cash += proceeds
+                pnl = proceeds - pos.cost_basis
+                trades.append(
+                    Trade(
+                        code=code, entry_date=pos.entry_date, exit_date=date_str,
+                        entry_price=pos.entry_price, exit_price=fill, shares=pos.shares,
+                        pnl=round(pnl, 2),
+                        return_pct=pnl / pos.cost_basis if pos.cost_basis > 0 else 0.0,
+                        exit_reason=reason, holding_days=pos.bars_held,
+                    )
+                )
+                del positions[code]
+
+            # --- 3. 收盘：更新持仓、产生明日订单 ---
+            equity = cash
+            snapshot = []
+            for code, pos in positions.items():
+                bar = self._bar(prepared, code, date)
+                mv = (bar["close"] if bar is not None else pos.entry_price) * pos.shares
+                equity += mv
+                pos.bars_held += 1
+                snapshot.append({"code": code, "shares": pos.shares, "market_value": round(mv, 2)})
+
+                # 收盘信号型卖出（自定义规则 / 持有到期）
+                if pos.entry_date == date_str:
+                    continue
+                reason = None
+                if exit_fn is not None and bar is not None:
+                    reason = exit_fn(prepared[code]["df"], date, pos)
+                if reason is None and pos.bars_held >= self.max_holding_days:
+                    reason = f"持有满{self.max_holding_days}日"
+                if reason:
+                    pos.__dict__["_exit_reason"] = reason
+                    pending_exits.append(code)
+
+            equity_values.append(equity)
+            daily_positions.append({"date": date_str, "cash": round(cash, 2),
+                                    "equity": round(equity, 2), "positions": snapshot})
+
+            # 生成明日买单
+            if day_i < len(calendar) - 1 and len(positions) < self.max_positions:
+                signals = self._signals_on(prepared, date, signal_col)
+                for code, info in signals[: self.max_entries_per_day]:
+                    if code not in positions:
+                        pending_entries.append(info)
+
+        equity_curve = pd.Series(equity_values, index=pd.DatetimeIndex(calendar), name="equity")
+        metrics = compute_metrics(
+            equity_values,
+            [{"return_pct": t.return_pct, "entry_date": t.entry_date,
+              "exit_date": t.exit_date} for t in trades],
+        )
+        metrics["initial_capital"] = self.initial_capital
+        metrics["final_equity"] = round(equity_values[-1], 2) if equity_values else 0.0
+        metrics["total_return"] = (
+            round(equity_values[-1] / self.initial_capital - 1, 4) if equity_values else 0.0
+        )
+        return BacktestResult(
+            trades=trades, equity_curve=equity_curve,
+            metrics=metrics, daily_positions=daily_positions,
+        )
+
+    # -- 内部工具 ---------------------------------------------------------
+
+    def _prepare(self, price_data, signal_col, stop_col, start_date, end_date) -> dict:
+        """把每只股票的数据切片并预转 numpy，避免循环里反复做 pandas 索引。"""
+        out = {}
+        lo = pd.Timestamp(start_date) if start_date else None
+        hi = pd.Timestamp(end_date) if end_date else None
+        for code, df in price_data.items():
+            if df is None or df.empty or signal_col not in df.columns:
+                continue
+            d = df
+            if lo is not None:
+                d = d[d.index >= lo]
+            if hi is not None:
+                d = d[d.index <= hi]
+            if len(d) < 2:
+                continue
+            out[code] = {
+                "df": d,
+                "pos": {ts: i for i, ts in enumerate(d.index)},
+                "open": d["open"].to_numpy(float),
+                "high": d["high"].to_numpy(float),
+                "low": d["low"].to_numpy(float),
+                "close": d["close"].to_numpy(float),
+                "sig": d[signal_col].fillna(False).to_numpy(bool),
+                "stop": (d[stop_col].to_numpy(float) if stop_col in d.columns
+                         else d["low"].to_numpy(float)),
+            }
+        return out
+
+    @staticmethod
+    def _build_calendar(prepared: dict) -> List[pd.Timestamp]:
+        all_dates = set()
+        for item in prepared.values():
+            all_dates.update(item["df"].index)
+        return sorted(all_dates)
+
+    @staticmethod
+    def _bar(prepared: dict, code: str, date) -> Optional[dict]:
+        item = prepared.get(code)
+        if item is None:
+            return None
+        i = item["pos"].get(date)
+        if i is None:
+            return None
+        return {
+            "i": i, "open": item["open"][i], "high": item["high"][i],
+            "low": item["low"][i], "close": item["close"][i],
+        }
+
+    def _signals_on(self, prepared: dict, date, signal_col: str) -> List[tuple]:
+        """返回当日触发买入信号的股票，按成交额降序。"""
+        hits = []
+        for code, item in prepared.items():
+            i = item["pos"].get(date)
+            if i is None or not item["sig"][i]:
+                continue
+            amount = float(item["df"]["amount"].iloc[i]) if "amount" in item["df"].columns else 0.0
+            hits.append(
+                (code, {"code": code, "signal_close": item["close"][i],
+                        "stop": float(item["stop"][i]), "amount": amount})
+            )
+        hits.sort(key=lambda x: x[1]["amount"], reverse=True)
+        return hits
+
+    def _is_limit_up_open(self, prepared: dict, code: str, date) -> bool:
+        """开盘一字涨停判定：开=高=低 且 较昨收涨停。"""
+        item = prepared[code]
+        i = item["pos"][date]
+        if i == 0:
+            return False
+        prev_close = item["close"][i - 1]
+        limit = self._limit_pct(code)
+        o, h, low = item["open"][i], item["high"][i], item["low"][i]
+        return (
+            abs(o - h) < 1e-6 and abs(o - low) < 1e-6
+            and o >= prev_close * (1 + limit) - 0.011
+        )
+
+    def _is_limit_down_open(self, prepared: dict, code: str, date) -> bool:
+        item = prepared[code]
+        i = item["pos"][date]
+        if i == 0:
+            return False
+        prev_close = item["close"][i - 1]
+        limit = self._limit_pct(code)
+        o, h, low = item["open"][i], item["high"][i], item["low"][i]
+        return (
+            abs(o - h) < 1e-6 and abs(o - low) < 1e-6
+            and o <= prev_close * (1 - limit) + 0.011
+        )
+
+    def _limit_pct(self, code: str) -> float:
+        bt = self.cfg.get("backtest", {})
+        code = str(code).zfill(6)
+        if code.startswith(("300", "301")):
+            return float(bt.get("limit_up_chi_next", 0.20))
+        if code.startswith("688"):
+            return float(bt.get("limit_up_star", 0.20))
+        return float(bt.get("limit_up_pct", 0.10))
+
+    @staticmethod
+    def _intraday_exit(bar: dict, pos: Position) -> tuple:
+        """盘中止损优先于止盈（同一根 K 线无法判断先后，保守取最坏情况）。"""
+        if bar["low"] <= pos.stop_loss:
+            return True, pos.stop_loss, "止损"
+        if bar["high"] >= pos.take_profit:
+            return True, pos.take_profit, "止盈"
+        return False, 0.0, ""
+
+    def _fill_price(self, price: float, side: str) -> float:
+        slip = price * self.slippage
+        return round(price + slip if side == "BUY" else price - slip, 2)
+
+    def _buy_cost(self, price: float, shares: int) -> tuple:
+        turnover = price * shares
+        fee = max(turnover * self.commission, self.commission_min) + turnover * self.transfer_fee
+        return turnover + fee, fee
+
+    def _sell_proceeds(self, price: float, shares: int) -> tuple:
+        turnover = price * shares
+        fee = (
+            max(turnover * self.commission, self.commission_min)
+            + turnover * self.stamp_tax
+            + turnover * self.transfer_fee
+        )
+        return turnover - fee, fee
+
+    def _position_budget(self, cash: float, positions: dict, price: float) -> float:
+        """等权分配剩余仓位，不超过现金。"""
+        slots_left = max(1, self.max_positions - len(positions))
+        return min(cash * 0.98, cash / slots_left)

@@ -41,3 +41,4 @@ def test_scan_limit_zero_scans_entire_universe(monkeypatch):
 
     assert seen == codes
     assert len(candidates) == len(codes)
+    assert candidates.attrs["total_matches"] == len(codes)

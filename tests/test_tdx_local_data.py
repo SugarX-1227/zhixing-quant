@@ -247,6 +247,57 @@ def test_store_can_be_used_from_streamlit_worker_thread(tmp_path):
     assert errors == []
 
 
+def test_health_stats_uses_sync_state_totals(tmp_path):
+    store = BarStore(tmp_path / "health.db")
+    store.upsert_bars("600000", _sample_frame([20240102, 20240103]))
+    store.set_sync_state("600000", "sh", 64, 1700000000.0, 2, 20240103)
+
+    stats = store.health_stats()
+
+    assert stats["bars"] == 2
+    assert stats["codes"] == 1
+    assert stats["date_max"] == 20240103
+    store.close()
+
+
+def test_xdxr_sync_uses_codes_with_bars(monkeypatch, tmp_path):
+    from zhixing_quant.data import xdxr
+
+    store = BarStore(tmp_path / "xdxr.db")
+    store.upsert_bars("600000", _sample_frame([20240102]))
+    store.upsert_bars("sh000001", _sample_frame([20240102]))
+    store.upsert_securities([("999999", "stale", "sz", "MAIN")])
+    monkeypatch.setattr(xdxr, "BarStore", lambda _: store)
+    monkeypatch.setattr("zhixing_quant.data.sync.db_path", lambda _: tmp_path / "xdxr.db")
+
+    class FakeApi:
+        def __init__(self, **kwargs):
+            self.queries = []
+
+        def connect(self, *args, **kwargs):
+            return True
+
+        def get_xdxr_info(self, market, code):
+            self.queries.append((market, code))
+            return []
+
+        def disconnect(self):
+            pass
+
+    fake = FakeApi()
+    monkeypatch.setattr(xdxr, "TdxHq_API", lambda **kwargs: fake, raising=False)
+    # The import is local in update_xdxr, so provide a fake pytdx module.
+    import sys, types
+    monkeypatch.setitem(sys.modules, "pytdx", types.ModuleType("pytdx"))
+    hq = types.ModuleType("pytdx.hq")
+    hq.TdxHq_API = lambda **kwargs: fake
+    monkeypatch.setitem(sys.modules, "pytdx.hq", hq)
+
+    xdxr.update_xdxr({}, codes=None, verbose=False)
+    assert sorted(fake.queries) == [(1, "000001"), (1, "600000")]
+    store.close()
+
+
 def test_from_tnf_reads_current_360_byte_records(tmp_path):
     cache = tmp_path / "T0002" / "hq_cache"
     cache.mkdir(parents=True)

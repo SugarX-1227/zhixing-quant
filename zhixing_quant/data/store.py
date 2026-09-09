@@ -337,23 +337,33 @@ class BarStore:
             )
         trade_date = int(row["d"])
 
+        # The target date is known above. Restrict the main table by its
+        # date index, then use the primary key for each code's prior close.
+        # This avoids ranking all 16M bars in a window function on every call.
         sql = """
-        WITH ranked AS (
-            SELECT code, trade_date, open, high, low, close, amount, vol,
-                   ROW_NUMBER() OVER (PARTITION BY code ORDER BY trade_date DESC) AS rn
+        WITH dates AS (
+            SELECT MAX(trade_date) AS prev_date
             FROM daily_bar
-            WHERE trade_date <= ?
+            WHERE trade_date < ?
         )
         SELECT t.code,
                COALESCE(s.name, '') AS name,
                t.trade_date, t.open, t.high, t.low, t.close, t.amount, t.vol,
-               p.close AS pre_close
-        FROM ranked t
-        LEFT JOIN ranked p ON p.code = t.code AND p.rn = 2
+               COALESCE(
+                   p.close,
+                   (SELECT prev.close
+                    FROM daily_bar prev
+                    WHERE prev.code = t.code AND prev.trade_date < t.trade_date
+                    ORDER BY prev.trade_date DESC LIMIT 1)
+               ) AS pre_close
+        FROM daily_bar t
+        LEFT JOIN daily_bar p
+          ON p.code = t.code AND p.trade_date = (SELECT prev_date FROM dates)
         LEFT JOIN security s ON s.code = t.code
-        WHERE t.rn = 1 AND t.trade_date = ?
+        WHERE t.trade_date = ?
         """
-        df = pd.read_sql_query(sql, self.conn, params=[int(trade_date), int(trade_date)])
+        df = pd.read_sql_query(sql, self.conn,
+                               params=[int(trade_date), int(trade_date)])
         if df.empty:
             return pd.DataFrame(columns=["code", "name", "close", "amount", "pct_chg", "date"])
         df["pct_chg"] = (df["close"] / df["pre_close"] - 1.0) * 100.0
@@ -404,6 +414,51 @@ class BarStore:
             "codes": int(codes or 0),
             "date_min": rng["lo"],
             "date_max": market_date if market_date is not None else rng["hi"],
+            "named": int(named or 0),
+            "xdxr_codes": int(xdxr_n or 0),
+            "db_size_mb": round(self.db_path.stat().st_size / 1024 / 1024, 1)
+            if self.db_path.exists()
+            else 0.0,
+            "last_sync": self.get_meta("last_sync", "never"),
+        }
+
+    def health_stats(self) -> dict:
+        """Return dashboard statistics without scanning the full bar table.
+
+        The sync state stores one row per imported file and its record count,
+        so the common path stays fast even for a multi-million-row database.
+        Small test databases or manually-created stores may not have sync
+        state; those use the exact legacy calculation instead.
+        """
+        c = self.conn
+        synced = c.execute("SELECT COUNT(*) AS n FROM sync_state").fetchone()["n"]
+        if not synced:
+            return self.stats()
+
+        bars = c.execute(
+            "SELECT COALESCE(SUM(record_count), 0) AS n FROM sync_state"
+        ).fetchone()["n"]
+        codes = int(synced)
+        date_min = c.execute(
+            "SELECT trade_date FROM daily_bar ORDER BY trade_date LIMIT 1"
+        ).fetchone()[0]
+        date_max = c.execute(
+            "SELECT trade_date FROM daily_bar ORDER BY trade_date DESC LIMIT 1"
+        ).fetchone()[0]
+        market_date = c.execute(
+            "SELECT MAX(trade_date) AS d FROM daily_bar WHERE code = 'sh000001'"
+        ).fetchone()["d"]
+        named = c.execute(
+            "SELECT COUNT(*) AS n FROM security WHERE name != ''"
+        ).fetchone()["n"]
+        xdxr_n = c.execute(
+            "SELECT COUNT(DISTINCT code) AS n FROM xdxr"
+        ).fetchone()["n"]
+        return {
+            "bars": int(bars or 0),
+            "codes": codes,
+            "date_min": date_min,
+            "date_max": market_date if market_date is not None else date_max,
             "named": int(named or 0),
             "xdxr_codes": int(xdxr_n or 0),
             "db_size_mb": round(self.db_path.stat().st_size / 1024 / 1024, 1)

@@ -127,7 +127,10 @@ def scan(
 
     max_candidates = int(cfg.get("universe", {}).get("max_candidates", 10))
     df = pd.DataFrame(candidates).sort_values("amount", ascending=False)
+    total_matches = len(df)
     df = df.head(max_candidates).reset_index(drop=True)
+    # Keep the uncapped count available to the CLI/UI and self-check output.
+    df.attrs["total_matches"] = total_matches
     kept = set(df["code"])
     chart_data = {c: v for c, v in chart_data.items() if c in kept}
     return df, chart_data
@@ -138,7 +141,10 @@ def print_candidates(spec: StrategySpec, candidates: pd.DataFrame) -> None:
     if candidates.empty:
         print(f"{spec.label}：当日无符合条件的标的。")
         return
-    print(f"\n{spec.label}  {candidates['date'].iloc[0]}  共 {len(candidates)} 只\n")
+    total = int(candidates.attrs.get("total_matches", len(candidates)))
+    shown = len(candidates)
+    count = f"{shown}/{total}" if total > shown else str(shown)
+    print(f"\n{spec.label}  {candidates['date'].iloc[0]}  命中 {count} 只\n")
     view = candidates.copy()
     view["成交额(亿)"] = (view["amount"] / 1e8).round(2)
     cols = ["code", "name", "close", "成交额(亿)"]

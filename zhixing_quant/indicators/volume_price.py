@@ -37,7 +37,11 @@ def add_volume_price(df: pd.DataFrame, vol_ma_window: int = 5) -> pd.DataFrame:
 
     out["vol_ratio_prev"] = vol_ratio
     out["is_double_vol"] = vol_ratio >= 2.0
-    out["is_sky_vol"] = out["is_double_vol"] & (ref(out["is_double_vol"], 1).fillna(False))
+    # Keep the shifted boolean dtype explicit; fillna on the object result
+    # emits a pandas downcasting warning on recent versions.
+    out["is_sky_vol"] = out["is_double_vol"] & out["is_double_vol"].shift(
+        1, fill_value=False
+    )
     out["is_low_vol"] = (vol < vol_ma * 0.6) & (vol < vol_prev)
     out["is_floor_vol"] = vol == ma(vol, 20).rolling(20, min_periods=1).min()
     out["is_flat_vol"] = (vol_ratio - 1).abs() < 0.05

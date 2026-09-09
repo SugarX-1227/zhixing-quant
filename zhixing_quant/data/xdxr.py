@@ -45,11 +45,21 @@ def update_xdxr(cfg: dict, codes: Optional[List[str]] = None, verbose: bool = Tr
 
     store = BarStore(db_path(cfg))
     if codes is None:
-        secs = store.load_securities()
-        codes = [c for c in secs["code"].tolist()]
+        # Request only symbols that actually have market bars. The security
+        # table may contain tens of thousands of stale/name-only records,
+        # which needlessly multiplies TDX requests and can trigger throttling.
+        rows = store.conn.execute(
+            "SELECT DISTINCT code FROM daily_bar ORDER BY code"
+        ).fetchall()
+        codes = [str(row["code"]) for row in rows]
 
     api = TdxHq_API(heartbeat=True)
-    servers = [("119.147.212.81", 7709), ("218.108.98.244", 7709)]
+    # Keep multiple public TDX nodes; availability varies by ISP and time.
+    servers = [
+        ("60.12.136.250", 7709),
+        ("119.147.212.81", 7709),
+        ("218.108.98.244", 7709),
+    ]
     records: List[Tuple] = []
     ok, fail = 0, 0
 
@@ -69,9 +79,11 @@ def update_xdxr(cfg: dict, codes: Optional[List[str]] = None, verbose: bool = Tr
 
     try:
         for i, code in enumerate(codes, 1):
-            market = 1 if str(code).startswith(("6", "5")) else 0
+            code_s = str(code)
+            market = 1 if code_s.startswith(("sh", "6", "5")) else 0
             try:
-                events = api.get_xdxr_info(market, str(code))
+                query_code = code_s[2:] if code_s.startswith(("sh", "sz")) else code_s
+                events = api.get_xdxr_info(market, query_code)
             except Exception:
                 fail += 1
                 continue

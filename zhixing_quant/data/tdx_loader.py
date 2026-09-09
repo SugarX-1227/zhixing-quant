@@ -229,7 +229,7 @@ def data_health(cfg: Optional[dict] = None) -> dict:
     except DataNotReady as exc:
         return {"ok": False, "message": str(exc)}
 
-    stats = store.stats()
+    stats = store.health_stats()
     warnings: List[str] = []
     if stats["named"] == 0:
         warnings.append("股票名称表为空，ST 过滤不生效。跑 `--names` 补上。")

@@ -49,14 +49,14 @@ def add_macd(
     bull_div = pd.Series(False, index=close.index)
     bear_div = pd.Series(False, index=close.index)
     for i in range(divergence_window, len(close)):
-        win_p = price.iloc[i - divergence_window : i + 1]
+        win_p = close.iloc[i - divergence_window : i + 1]
         win_d = dif.iloc[i - divergence_window : i + 1]
         p_low_idx = win_p.idxmin()
         d_low_idx = win_d.idxmin()
         p_prev_low_idx = win_p.iloc[:-1].idxmin() if len(win_p) > 1 else p_low_idx
         d_prev_low_idx = win_d.iloc[:-1].idxmin() if len(win_d) > 1 else d_low_idx
-        cur_p = float(price.iloc[i])
-        prev_p = float(price.loc[p_prev_low_idx]) if p_prev_low_idx in price.index else cur_p
+        cur_p = float(close.iloc[i])
+        prev_p = float(close.loc[p_prev_low_idx]) if p_prev_low_idx in close.index else cur_p
         cur_d = float(dif.iloc[i])
         prev_d = float(dif.loc[d_prev_low_idx]) if d_prev_low_idx in dif.index else cur_d
         if cur_p < prev_p and cur_d > prev_d:

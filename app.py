@@ -2,14 +2,8 @@
 
     streamlit run app.py
 
-页面按规格 01 的每日决策循环组织，而不是按功能清单：
-
-    今日   择时 → 防守 → 进攻 → 下单计划（这就是 daily_cycle 的可视化）
-    持仓   持仓明细、成交记录、账户设置
-    战法   六套战法各自扫描
-    回测   策略回测
-    个股   K线 + 全部指标
-    数据   本地行情库同步
+页面按规格 01 的每日决策循环组织：
+    今日 · 持仓 · 战法 · 回测 · 个股 · 数据
 """
 
 from __future__ import annotations
@@ -21,16 +15,19 @@ from datetime import datetime, timedelta
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="知行量化", layout="wide", page_icon="📈")
+st.set_page_config(page_title="知行量化", layout="wide", page_icon="📈",
+                   initial_sidebar_state="expanded")
 
-from zhixing_quant.ui import components as C          # noqa: E402
-from zhixing_quant.ui.theme import (                  # noqa: E402
-    apply_layout, candlestick_colors, inject_css, MA_FAST, SIGNAL_LINE,
+from zhixing_quant.ui import components as C            # noqa: E402
+from zhixing_quant.ui import param_schema as PS         # noqa: E402
+from zhixing_quant.ui.theme import (                    # noqa: E402
+    MA_FAST, SIGNAL_LINE, apply_layout, candlestick_colors, inject_css,
 )
 
 inject_css()
 
 BOOKS = {"swing": "波段账户", "scalp": "超短账户"}
+PAGE_ORDER = ["今日", "持仓", "战法", "回测", "个股", "数据"]
 
 
 @st.cache_resource
@@ -41,7 +38,6 @@ def get_config():
 
 @st.cache_data(ttl=60, show_spinner=False)
 def _health():
-    """Cache the expensive database-wide health check between reruns."""
     from zhixing_quant.data.tdx_loader import data_health
     return data_health()
 
@@ -57,40 +53,49 @@ def _strategies():
     return available()
 
 
+def _param_widget(p: PS.Param, cfg: dict, key: str):
+    """按声明渲染一个参数控件，返回当前值。"""
+    cur = PS.get_value(cfg, p.key, p.default)
+    label = p.label + ("  🔒" if p.tag == "LOCKED" else "")
+    help_txt = (p.help + ("（规格标为 LOCKED，是规则本身，改动前想清楚）"
+                          if p.tag == "LOCKED" else "")) or None
+    if p.kind == "bool":
+        return st.checkbox(label, value=bool(cur), key=key, help=help_txt)
+    if p.kind == "int":
+        return int(st.number_input(label, int(p.lo), int(p.hi), int(cur),
+                                   int(p.step or 1), key=key, help=help_txt))
+    return float(st.number_input(label, float(p.lo), float(p.hi), float(cur),
+                                 float(p.step or 0.01), key=key, help=help_txt,
+                                 format="%.5f" if (p.step or 1) < 0.001 else "%.4f"))
+
+
 # ---------------------------------------------------------------------------
 # 今日
 # ---------------------------------------------------------------------------
 
 def page_today(cfg, book):
     strategies = _strategies()
-    c1, c2, c3, c4 = st.columns([2, 2, 1, 1])
     names = list(strategies)
+    c1, c2, c3, c4 = st.columns([2.2, 1.6, 1.2, 1])
     default = next((n for n, m in strategies.items() if m["book"] == book), names[0])
-    strategy = c1.selectbox(
-        "战法", names, index=names.index(default),
-        format_func=lambda n: f"{strategies[n]['label']}（规格 {strategies[n].get('spec','')}）",
-    )
+    strategy = c1.selectbox("战法", names, index=names.index(default),
+                            format_func=lambda n: strategies[n]["label"])
     scan_date = c2.date_input("信号日期", value=datetime.now())
-    c3.write("")
-    c3.write("")
-    limit = c3.number_input("扫描上限", 0, 5000, 0, 50,
-                            help="0 表示扫描全部股票。")
+    limit = c3.number_input("扫描范围", 50, 6000, 500, 50,
+                            help="按成交额降序取前 N 只。设大会更慢")
     c4.write("")
     c4.write("")
     run = c4.button("运行", type="primary", use_container_width=True)
 
     if run:
         from zhixing_quant.executor.daily_workflow import run_daily_cycle
-
-        bar = st.progress(0.0, text="扫描中...")
+        bar = st.progress(0.0, text="运行中...")
         try:
             result = run_daily_cycle(
                 cfg, date=scan_date.strftime("%Y%m%d"), book=book,
-                strategy_key=strategy,
-                limit_universe=int(limit) or None,
+                strategy_key=strategy, limit_universe=int(limit),
                 progress=lambda d, t: bar.progress(min(d / max(t, 1), 1.0),
-                                                   text=f"扫描中... {d}/{t}"),
-            )
+                                                   text=f"扫描 {d}/{t}"))
         except Exception as exc:
             bar.empty()
             st.error(f"运行失败：{exc}")
@@ -101,77 +106,325 @@ def page_today(cfg, book):
     result = st.session_state.get(f"today_{book}")
     if result is None:
         C.empty_state("还没有今日决策",
-                      "选好战法和日期后点「运行」。系统会按 择时 → 防守 → 进攻 → 下单 的顺序走一遍。")
+                      "选好战法和日期后点「运行」。系统按 择时 → 防守 → 进攻 → 下单 的顺序走一遍，"
+                      "这个顺序是规格里锁定的，防守永远优先于买入。")
         return
 
     C.page_head("今日", f"{result.date} 收盘后 · {BOOKS[book]}")
 
-    # 阶段 1
     C.section("择时", "决定今天是否允许开新仓",
-              f"{'允许开仓 · 上限 ' + format(result.max_total_pct, '.0%') if result.allow_open else '禁止开仓'}")
+              f"允许开仓 · 上限 {result.max_total_pct:.0%}" if result.allow_open else "禁止开仓")
     C.regime_card(result)
 
-    # 阶段 2
     need = len(result.actions_needed)
     C.section("防守", "先处理持仓，优先级高于任何买入",
               f"{need} 个需要动作" if need else f"{len(result.reviews)} 个持仓正常",
               warn=need > 0)
     if not result.reviews:
-        C.empty_state("当前没有持仓", "到「持仓」页手工登记，或在下面的下单计划里记录建仓。")
+        C.empty_state("当前没有持仓", "到「持仓」页登记，或在下面的下单计划里记录建仓。")
     else:
         for v in result.reviews:
             C.holding_card(v)
         C.defense_coverage_chips(result.defense_coverage)
 
-    # 阶段 3
-    label = _strategies().get(result.candidates.attrs.get("key", ""), {}).get("label", "")
-    total_candidates = int(result.candidates.attrs.get(
-        "total_matches", len(result.candidates)
-    ))
-    count_label = (f"命中 {total_candidates} 只（显示前 {len(result.candidates)} 只）"
-                   if total_candidates > len(result.candidates)
-                   else f"命中 {len(result.candidates)} 只")
     C.section("进攻", "择时放行后才评估",
-              result.offense_disabled_reason and "已禁用" or count_label)
+              "已禁用" if result.offense_disabled_reason
+              else f"命中 {len(result.candidates)} 只")
     if result.offense_disabled_reason:
         st.info(result.offense_disabled_reason)
     elif result.candidates.empty:
         C.empty_state("今天没有符合条件的标的",
-                      "可以换个战法试试，或到「数据」页确认行情已同步到最新交易日。")
+                      "换个战法试试，或到「数据」页确认行情已同步到最新交易日。")
     else:
-        C.candidate_table(result.candidates)
+        _list_and_chart(result.candidates, result.charts, key="today")
 
-    # 阶段 4
     ok = [p for p in result.plans if not p.blocked]
-    blocked = [p for p in result.plans if p.blocked]
     if result.plans:
         C.section("下单计划", "含止损与风险敞口，缺止损不允许下单",
-                  f"{len(ok)} 条可执行 · {len(blocked)} 条拦截")
+                  f"{len(ok)} 条可执行 · {len(result.plans) - len(ok)} 条拦截")
         for p in result.plans:
             C.plan_card(p)
         if ok:
-            st.markdown("**记录建仓**（按计划的股数和止损写入持仓）")
-            cols = st.columns(min(len(ok), 4))
+            st.caption("记录建仓（按计划的股数和止损写入持仓）")
+            cols = st.columns(min(len(ok), 5))
             for i, p in enumerate(ok):
-                if cols[i % 4].button(f"{p.code} {p.name}", key=f"buy_{p.code}"):
+                if cols[i % 5].button(f"{p.code}", key=f"buy_{p.code}",
+                                      use_container_width=True):
                     store = _store(cfg)
                     try:
-                        store.open_position(
-                            p.code, p.shares, p.entry_price, p.stop_loss,
-                            book=book, name=p.name, strategy=p.strategy,
-                            take_profit=p.take_profit, entry_date=result.date,
-                        )
+                        store.open_position(p.code, p.shares, p.entry_price,
+                                            p.stop_loss, book=book, name=p.name,
+                                            strategy=p.strategy,
+                                            take_profit=p.take_profit,
+                                            entry_date=result.date)
                         st.success(f"已记录 {p.code} {p.shares} 股，止损 {p.stop_loss:.2f}")
                     except ValueError as exc:
                         st.error(str(exc))
                     finally:
                         store.close()
-
     C.notes(result.notes)
 
 
 # ---------------------------------------------------------------------------
-# 持仓
+# 战法
+# ---------------------------------------------------------------------------
+
+def page_strategies(cfg, book):
+    C.page_head("战法", "六套战法独立扫描")
+    strategies = _strategies()
+
+    c1, c2, c3, c4 = st.columns([2.2, 1.2, 1.2, 1])
+    name = c1.selectbox("战法", list(strategies),
+                        format_func=lambda n: f"{strategies[n]['label']}"
+                                              f"（{BOOKS[strategies[n]['book']]}）")
+    scan_date = c2.date_input("日期", value=datetime.now(), key="strat_date")
+    limit = c3.number_input("扫描范围", 50, 6000, 500, 50, key="strat_limit")
+    c4.write("")
+    c4.write("")
+    go = c4.button("扫描", type="primary", use_container_width=True)
+
+    with st.expander("战法参数（改完重新扫描生效）"):
+        params = PS.params_for(name)
+        if not params:
+            st.caption("这套战法没有声明可调参数。")
+            overrides = {}
+        else:
+            overrides = {}
+            cols = st.columns(min(len(params), 4))
+            for i, p in enumerate(params):
+                with cols[i % len(cols)]:
+                    overrides[p.key] = _param_widget(p, cfg, f"sp_{name}_{p.key}")
+            changed = PS.diff_from_default(overrides)
+            if changed:
+                st.caption("已改动：" + "、".join(f"{k}={v}" for k, v in changed.items()))
+        st.caption("规格 10 里这些参数标为 [CALIBRATE]，给的是初始猜测值，需要用回测校准。")
+
+    if go:
+        from zhixing_quant.scanner.strategy_scan import scan_strategy
+        local = PS.apply_overrides(cfg, overrides)
+        local.setdefault("universe", {})["max_candidates"] = 9999   # 不截断
+        bar = st.progress(0.0, text="扫描中...")
+        try:
+            cands, charts = scan_strategy(
+                name, local, end_date=scan_date.strftime("%Y%m%d"),
+                limit_universe=int(limit),
+                progress=lambda d, t: bar.progress(min(d / max(t, 1), 1.0),
+                                                   text=f"扫描 {d}/{t}"))
+        except Exception as exc:
+            bar.empty()
+            st.error(f"扫描失败：{exc}")
+            return
+        bar.empty()
+        st.session_state["strat_res"] = (name, cands, charts, int(limit))
+
+    got = st.session_state.get("strat_res")
+    if got is None:
+        C.empty_state("选一套战法开始扫描",
+                      "每套战法的入场条件、止损位和适用账户都不同，规格 06 有完整说明。")
+        return
+
+    sname, cands, charts, scanned = got
+    meta = strategies.get(sname, {})
+    rate = len(cands) / max(scanned, 1)
+    C.section(meta.get("label", sname),
+              f"规格 {meta.get('spec','')} · 扫描 {scanned} 只",
+              f"命中 {len(cands)} 只（{rate:.1%}）",
+              warn=rate > 0.15)
+    if rate > 0.15:
+        st.warning(f"命中率 {rate:.0%} 偏高。条件可能过松，参数需要校准。")
+    if cands.empty:
+        C.empty_state("今天没有命中",
+                      "这套战法的信号本来就不是每天都有。连续一周为 0 才说明条件过严。")
+        return
+    _list_and_chart(cands, charts, key="strat")
+
+
+def _list_and_chart(cands: pd.DataFrame, charts: dict, key: str):
+    """左列表 + 右K线。点左边任意一行，右边立刻画出来。"""
+    left, right = st.columns([5, 7], gap="medium")
+
+    with left:
+        show = cands.copy()
+        cols = {"code": "代码", "name": "名称", "close": "收盘", "pct_chg": "涨跌%",
+                "amount": "成交额", "stop_loss": "止损", "confidence": "信心"}
+        avail = [c for c in cols if c in show.columns]
+        view = show[avail].rename(columns=cols)
+        if "成交额" in view:
+            view["成交额"] = (show["amount"] / 1e8).round(2)
+        sel = st.dataframe(
+            view, use_container_width=True, hide_index=True, height=520,
+            on_select="rerun", selection_mode="single-row", key=f"tbl_{key}",
+            column_config={
+                "涨跌%": st.column_config.NumberColumn(format="%+.2f"),
+                "成交额": st.column_config.NumberColumn("成交额(亿)", format="%.2f"),
+                "收盘": st.column_config.NumberColumn(format="%.2f"),
+                "止损": st.column_config.NumberColumn(format="%.2f"),
+            })
+        rows = sel.selection.rows if sel and sel.selection else []
+        idx = rows[0] if rows else 0
+        st.caption(f"共 {len(cands)} 只，点任意一行看右边的K线")
+
+    code = str(cands.iloc[idx]["code"])
+    with right:
+        nm = str(cands.iloc[idx].get("name", ""))
+        st.markdown(f"**{code}** {nm}")
+        if code in charts:
+            _draw_kline(charts[code], code, height=520)
+        else:
+            st.info("这只标的没有图表数据。")
+
+
+# ---------------------------------------------------------------------------
+# 回测
+# ---------------------------------------------------------------------------
+
+def page_backtest(cfg, book):
+    from zhixing_quant.backtest.runner import BACKTESTABLE
+    from zhixing_quant.data.universe import BOARDS, UniverseSpec
+
+    C.page_head("回测", "T 日收盘出信号，T+1 开盘成交")
+    strategies = _strategies()
+    names = [n for n in strategies if n in BACKTESTABLE]
+    blocked = [strategies[n]["label"] for n in strategies if n not in BACKTESTABLE]
+
+    c = st.columns([2, 1.4, 1.4, 1])
+    name = c[0].selectbox("战法", names, format_func=lambda n: strategies[n]["label"])
+    start = c[1].date_input("开始", value=datetime.now() - timedelta(days=730))
+    end = c[2].date_input("结束", value=datetime.now())
+    c[3].write("")
+    c[3].write("")
+    go = c[3].button("运行回测", type="primary", use_container_width=True)
+    if blocked:
+        st.caption(f"暂不支持回测：{'、'.join(blocked)}"
+                   "（信号需逐根K线求值，引擎读的是预算好的信号列）")
+
+    tabs = st.tabs(["股票池", "战法参数", "交易规则", "成本与风控"])
+
+    with tabs[0]:
+        u = st.columns([2, 1, 1, 1])
+        boards = u[0].multiselect("板块", list(BOARDS), default=["MAIN", "CHINEXT"],
+                                  format_func=lambda b: BOARDS[b])
+        size = u[1].number_input("池子大小", 10, 3000, 200, 10)
+        min_amt = u[2].number_input("成交额下限(亿)", 0.0, 100.0, 1.0, 0.5)
+        rank_by = u[3].selectbox("选池依据", ["amount", "random"],
+                                 format_func=lambda x: {"amount": "成交额降序",
+                                                        "random": "随机"}[x])
+        u2 = st.columns([1, 1, 2])
+        exclude_st = u2[0].checkbox("剔除 ST / 退市", value=True)
+        min_bars = u2[1].number_input("上市至少(根K线)", 0, 500, 120, 10)
+        u2[2].info(f"股票池按**开始日 {start:%Y-%m-%d}** 的数据选出。"
+                   "用最新数据选池会引入前视偏差，回测收益会被系统性抬高。")
+        spec = UniverseSpec(boards=tuple(boards) or ("MAIN",), size=int(size),
+                            min_amount=min_amt * 1e8, exclude_st=exclude_st,
+                            min_listed_bars=int(min_bars), rank_by=rank_by)
+
+    overrides = {}
+    with tabs[1]:
+        params = PS.params_for(name)
+        if params:
+            cols = st.columns(min(len(params), 4))
+            for i, p in enumerate(params):
+                with cols[i % len(cols)]:
+                    overrides[p.key] = _param_widget(p, cfg, f"bt_{name}_{p.key}")
+        else:
+            st.caption("这套战法没有声明可调参数。")
+
+    with tabs[2]:
+        cols = st.columns(4)
+        for i, p in enumerate(PS.EXECUTION_PARAMS):
+            with cols[i % 4]:
+                overrides[p.key] = _param_widget(p, cfg, f"bt_ex_{p.key}")
+
+    with tabs[3]:
+        cols = st.columns(3)
+        for i, p in enumerate(PS.COST_PARAMS):
+            with cols[i % 3]:
+                overrides[p.key] = _param_widget(p, cfg, f"bt_co_{p.key}")
+        cols = st.columns(3)
+        for i, p in enumerate(PS.RISK_PARAMS):
+            with cols[i % 3]:
+                overrides[p.key] = _param_widget(p, cfg, f"bt_ri_{p.key}")
+
+    if go:
+        from zhixing_quant.backtest.runner import run_backtest
+        local = PS.apply_overrides(cfg, overrides)
+        bar = st.progress(0.0, text="准备数据...")
+        try:
+            run = run_backtest(local, name, start.strftime("%Y%m%d"),
+                               end.strftime("%Y%m%d"), spec=spec,
+                               universe_as_of=start.strftime("%Y%m%d"),
+                               progress=lambda d, t: bar.progress(
+                                   min(d / max(t, 1), 1.0), text=f"计算指标 {d}/{t}"))
+        except Exception as exc:
+            bar.empty()
+            st.error(f"回测失败：{exc}")
+            return
+        bar.empty()
+        st.session_state["bt"] = (run, PS.diff_from_default(overrides))
+
+    got = st.session_state.get("bt")
+    if got is None:
+        C.empty_state("配置好参数后运行回测",
+                      "参数大多标为 [CALIBRATE]，是规格给的初始猜测值。"
+                      "回测的意义就是用你自己的数据把它们定下来。")
+        return
+
+    run, changed = got
+    for w in run.warnings:
+        st.warning(w)
+    st.caption(f"股票池：{run.universe_note}　|　实际回测 {run.loaded} 只"
+               + (f"，跳过 {run.skipped} 只（K线不足）" if run.skipped else ""))
+    if changed:
+        st.caption("改动的参数：" + "、".join(f"`{k}`={v}" for k, v in changed.items()))
+
+    m = run.metrics
+    ex = run.excess_return
+    C.stat_row([("总收益", f"{m.get('total_return',0):.2%}",
+                 "up" if m.get("total_return", 0) >= 0 else "down"),
+                ("年化", f"{m.get('annualized_return',0):.2%}",
+                 "up" if m.get("annualized_return", 0) >= 0 else "down"),
+                ("最大回撤", f"{m.get('max_drawdown',0):.2%}", ""),
+                ("夏普", f"{m.get('sharpe',0):.2f}", "")])
+    C.stat_row([("胜率", f"{m.get('win_rate',0):.1%}", ""),
+                ("盈亏比", f"{m.get('profit_loss_ratio',0):.2f}", ""),
+                ("交易笔数", m.get("total_trades", 0), ""),
+                ("超额收益" if ex is not None else "期末权益",
+                 f"{ex:.2%}" if ex is not None else f"{m.get('final_equity',0):,.0f}",
+                 ("up" if (ex or 0) >= 0 else "down") if ex is not None else "")])
+
+    if len(run.equity_curve) > 1:
+        import plotly.graph_objects as go
+        from zhixing_quant.ui.theme import DOWN, TEXT_3
+        eq = run.equity_curve
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=eq.index, y=eq.values, name="策略",
+                                 line=dict(width=2, color=SIGNAL_LINE)))
+        if run.benchmark is not None and not run.benchmark.empty:
+            fig.add_trace(go.Scatter(x=run.benchmark.index, y=run.benchmark.values,
+                                     name="基准指数",
+                                     line=dict(width=1.2, color=TEXT_3, dash="dot")))
+        apply_layout(fig, height=320, title="资金曲线")
+        st.plotly_chart(fig, use_container_width=True)
+
+        dd = run.drawdown
+        f2 = go.Figure(go.Scatter(x=dd.index, y=dd.values, name="回撤", fill="tozeroy",
+                                  line=dict(color=DOWN, width=1)))
+        apply_layout(f2, height=180, title="回撤")
+        f2.update_layout(yaxis_tickformat=".0%")
+        st.plotly_chart(f2, use_container_width=True)
+
+    if not run.trades.empty:
+        left, right = st.columns([7, 3], gap="medium")
+        left.markdown("**成交明细**")
+        left.dataframe(run.trades.sort_values("entry_date", ascending=False),
+                       use_container_width=True, hide_index=True, height=320)
+        right.markdown("**卖出原因**")
+        counts = run.trades["exit_reason"].value_counts()
+        right.dataframe(counts.rename("笔数"), use_container_width=True)
+
+
+# ---------------------------------------------------------------------------
+# 持仓 / 个股 / 数据
 # ---------------------------------------------------------------------------
 
 def page_positions(cfg, book):
@@ -180,23 +433,22 @@ def page_positions(cfg, book):
     try:
         positions = store.positions(book)
         cash = store.cash(book)
-
-        from zhixing_quant.data.tdx_loader import fetch_a_spot
         try:
+            from zhixing_quant.data.tdx_loader import fetch_a_spot
             spot = fetch_a_spot()
             prices = dict(zip(spot["code"], spot["close"]))
         except Exception:
             prices = {}
-
         equity = store.equity(prices, book)
         stats = store.stats(book)
-        C.stat_row([
-            ("账户权益", C.money(equity), ""),
-            ("可用现金", C.money(cash), ""),
-            ("累计盈亏", C.money(stats["total_pnl"]),
-             "up" if stats["total_pnl"] >= 0 else "down"),
-            ("胜率", f"{stats['win_rate']:.0%}" if stats["trades"] else "—", ""),
-        ])
+
+        if cash == 0 and not positions:
+            st.info("这个账户还没初始化。先在下面设置可用现金，权益和仓位才有意义。")
+        C.stat_row([("账户权益", C.money(equity), ""),
+                    ("可用现金", C.money(cash), ""),
+                    ("累计盈亏", C.money(stats["total_pnl"]),
+                     "up" if stats["total_pnl"] >= 0 else "down"),
+                    ("胜率", f"{stats['win_rate']:.0%}" if stats["trades"] else "—", "")])
 
         C.section("当前持仓", "", f"{len(positions)} 只")
         if not positions:
@@ -206,18 +458,17 @@ def page_positions(cfg, book):
             rows = []
             for p in positions:
                 px = float(prices.get(p["code"], p["entry_price"]))
-                rows.append({
-                    "code": p["code"], "name": p["name"], "close": px,
-                    "pct_chg": (px / p["entry_price"] - 1) * 100,
-                    "stop_loss": p["stop_loss"],
-                    "take_profit": p.get("take_profit") or float("nan"),
-                })
+                rows.append({"code": p["code"], "name": p["name"], "close": px,
+                             "pct_chg": (px / p["entry_price"] - 1) * 100,
+                             "stop_loss": p["stop_loss"],
+                             "take_profit": p.get("take_profit") or float("nan")})
             C.candidate_table(pd.DataFrame(rows))
 
-            st.markdown("**平仓**")
+            st.caption("平仓")
             cc = st.columns([2, 1, 1, 1])
-            code = cc[0].selectbox("标的", [p["code"] for p in positions],
-                                   format_func=lambda c: f"{c} {dict((p['code'], p['name']) for p in positions).get(c,'')}")
+            namemap = {p["code"]: p["name"] for p in positions}
+            code = cc[0].selectbox("标的", list(namemap),
+                                   format_func=lambda c: f"{c} {namemap[c]}")
             price = cc[1].number_input("成交价", 0.01, 100000.0,
                                        float(prices.get(code, 10.0)), 0.01)
             reason = cc[2].selectbox("原因", ["止盈", "止损", "防守触发", "手工"])
@@ -225,22 +476,21 @@ def page_positions(cfg, book):
             cc[3].write("")
             if cc[3].button("平仓", use_container_width=True):
                 r = store.close_position(code, price, book=book, reason=reason)
-                st.success(f"已平仓 {code}，盈亏 {r['pnl']:,.0f}") if r else st.error("没找到该持仓")
+                st.success(f"已平仓 {code}，盈亏 {r['pnl']:,.0f}") if r else st.error("没找到")
                 st.rerun()
 
-        with st.expander("手工登记建仓 / 设置资金"):
+        with st.expander("手工登记 / 设置资金"):
             f = st.columns(5)
             mcode = f[0].text_input("代码", key="m_code")
-            mshares = f[1].number_input("股数", 100, 10_000_000, 100, 100, key="m_sh")
+            msh = f[1].number_input("股数", 100, 10_000_000, 100, 100, key="m_sh")
             mpx = f[2].number_input("买入价", 0.01, 100000.0, 10.0, 0.01, key="m_px")
-            mstop = f[3].number_input("止损价", 0.0, 100000.0, 9.5, 0.01, key="m_st")
+            mst = f[3].number_input("止损价", 0.0, 100000.0, 9.5, 0.01, key="m_st")
             f[4].write("")
             f[4].write("")
             if f[4].button("登记", use_container_width=True):
                 try:
-                    store.open_position(mcode.strip().zfill(6), int(mshares), mpx, mstop,
+                    store.open_position(mcode.strip().zfill(6), int(msh), mpx, mst,
                                         book=book)
-                    st.success("已登记")
                     st.rerun()
                 except ValueError as exc:
                     st.error(str(exc))
@@ -255,160 +505,22 @@ def page_positions(cfg, book):
         trades = store.trades(book)
         if not trades.empty:
             C.section("成交记录", "", f"{len(trades)} 笔")
-            st.dataframe(trades.drop(columns=["id", "book"]), use_container_width=True,
-                         hide_index=True, height=280)
+            st.dataframe(trades.drop(columns=["id", "book"]),
+                         use_container_width=True, hide_index=True, height=280)
     finally:
         store.close()
 
 
-# ---------------------------------------------------------------------------
-# 战法
-# ---------------------------------------------------------------------------
-
-def page_strategies(cfg, book):
-    C.page_head("战法", "六套战法独立扫描")
-    strategies = _strategies()
-
-    c1, c2, c3 = st.columns([2, 1, 1])
-    name = c1.selectbox("选择战法", list(strategies),
-                        format_func=lambda n: f"{strategies[n]['label']}"
-                                              f"（{BOOKS[strategies[n]['book']]}）")
-    limit = c2.number_input("扫描上限", 0, 5000, 0, 50,
-                            help="0 表示扫描全部股票。")
-    c3.write("")
-    c3.write("")
-    if c3.button("扫描", type="primary", use_container_width=True):
-        from zhixing_quant.scanner.strategy_scan import scan_strategy
-
-        bar = st.progress(0.0, text="扫描中...")
-        try:
-            cands, charts = scan_strategy(
-                name, cfg, limit_universe=int(limit) or None,
-                progress=lambda d, t: bar.progress(min(d / max(t, 1), 1.0),
-                                                   text=f"扫描中... {d}/{t}"))
-        except Exception as exc:
-            bar.empty()
-            st.error(f"扫描失败：{exc}")
-            return
-        bar.empty()
-        st.session_state["strat_res"] = (name, cands, charts)
-
-    got = st.session_state.get("strat_res")
-    if got is None:
-        C.empty_state("选一套战法开始扫描",
-                      "每套战法的入场条件、止损位和适用账户都不同，规格 06 有完整说明。")
-        return
-
-    sname, cands, charts = got
-    meta = strategies.get(sname, {})
-    total_matches = int(cands.attrs.get("total_matches", len(cands)))
-    count_label = (f"命中 {total_matches} 只（显示前 {len(cands)} 只）"
-                   if total_matches > len(cands) else f"命中 {len(cands)} 只")
-    C.section(meta.get("label", sname),
-              f"规格 {meta.get('spec','')} · {BOOKS.get(meta.get('book','swing'))}",
-              count_label)
-    if cands.empty:
-        C.empty_state("今天没有命中",
-                      "这套战法的信号本来就不是每天都有。可以换个战法或换个日期。")
-        return
-    C.candidate_table(cands)
-
-    codes = cands["code"].tolist()
-    sel = st.selectbox("查看K线", codes,
-                       format_func=lambda c: f"{c} {cands.loc[cands['code']==c,'name'].iloc[0]}")
-    if sel in charts:
-        _draw_kline(charts[sel], sel)
-
-
-# ---------------------------------------------------------------------------
-# 回测 / 个股 / 数据
-# ---------------------------------------------------------------------------
-
-def page_backtest(cfg, book):
-    C.page_head("回测", "T 日收盘出信号，T+1 开盘成交")
-    strategies = _strategies()
-    c = st.columns(4)
-    name = c[0].selectbox("战法", list(strategies),
-                          format_func=lambda n: strategies[n]["label"])
-    start = c[1].date_input("开始", value=datetime.now() - timedelta(days=730))
-    end = c[2].date_input("结束", value=datetime.now())
-    pool = c[3].number_input("股票池", 20, 2000, 200, 10)
-
-    if st.button("运行回测", type="primary"):
-        from zhixing_quant.backtest.engine import BacktestEngine
-        from zhixing_quant.data.tdx_loader import (fetch_a_spot, filter_universe,
-                                                   load_daily_many)
-        from zhixing_quant.indicators.pipeline import run_pipeline
-
-        try:
-            with st.spinner("准备数据..."):
-                uni = filter_universe(fetch_a_spot(), cfg).head(int(pool))
-                warm = (pd.Timestamp(start) - pd.Timedelta(days=400)).strftime("%Y%m%d")
-                raw = load_daily_many(uni["code"].tolist(), start_date=warm,
-                                      end_date=end.strftime("%Y%m%d"))
-                data = {}
-                for code, df in raw.items():
-                    if len(df) < 130:
-                        continue
-                    data[code] = run_pipeline(df, cfg, name if name in
-                                              ("brick", "b1", "b2") else "full").df
-            sig = {"brick": "sig_brick", "b1": "sig_b1", "b2": "sig_b2"}.get(name)
-            if sig is None:
-                st.warning(
-                    f"{strategies[name]['label']} 的信号需要逐根 K 线求值，"
-                    "回测引擎目前只支持预先算好信号列的战法（砖型图 / B1 / B2）。"
-                    "其余战法的回测支持在下一阶段。")
-                return
-            with st.spinner(f"回测 {len(data)} 只..."):
-                res = BacktestEngine(cfg).run(data, signal_col=sig,
-                                              start_date=start.strftime("%Y%m%d"),
-                                              end_date=end.strftime("%Y%m%d"))
-        except Exception as exc:
-            st.error(f"回测失败：{exc}")
-            return
-        st.session_state["bt"] = res
-
-    res = st.session_state.get("bt")
-    if res is None:
-        C.empty_state("配置参数后运行回测",
-                      "参数多数标记为 [CALIBRATE]，当前是规格给的初始猜测值，需要用你的数据校准。")
-        return
-    m = res.metrics
-    C.stat_row([("总收益", f"{m.get('total_return',0):.2%}",
-                 "up" if m.get("total_return", 0) >= 0 else "down"),
-                ("年化", f"{m.get('annualized_return',0):.2%}",
-                 "up" if m.get("annualized_return", 0) >= 0 else "down"),
-                ("最大回撤", f"{m.get('max_drawdown',0):.2%}", ""),
-                ("夏普", f"{m.get('sharpe',0):.2f}", "")])
-    C.stat_row([("胜率", f"{m.get('win_rate',0):.1%}", ""),
-                ("盈亏比", str(m.get("profit_loss_ratio", "—")), ""),
-                ("交易笔数", m.get("total_trades", 0), ""),
-                ("期末权益", f"{m.get('final_equity',0):,.0f}", "")])
-
-    if len(res.equity_curve) > 1:
-        import plotly.graph_objects as go
-        eq = res.equity_curve
-        fig = go.Figure(go.Scatter(x=eq.index, y=eq.values, name="权益",
-                                   line=dict(width=2, color=SIGNAL_LINE)))
-        apply_layout(fig, height=320, title="资金曲线")
-        st.plotly_chart(fig, use_container_width=True)
-    tf = res.trades_frame()
-    if not tf.empty:
-        st.dataframe(tf.sort_values("entry_date", ascending=False),
-                     use_container_width=True, hide_index=True, height=300)
-
-
 def page_chart(cfg, book):
     C.page_head("个股", "K线与全部指标")
-    c = st.columns([1, 1, 1])
+    c = st.columns([1, 1.4, 1])
     code = c[0].text_input("代码", value="600000")
-    days = c[1].slider("显示天数", 60, 300, 140)
+    days = c[1].slider("显示天数", 60, 400, 160)
     c[2].write("")
     c[2].write("")
     if c[2].button("加载", type="primary", use_container_width=True):
         from zhixing_quant.data.tdx_loader import load_daily
         from zhixing_quant.indicators.pipeline import defense_coverage, run_pipeline
-
         try:
             df = load_daily(code.strip().zfill(6), adjust="qfq")
             if df.empty:
@@ -418,21 +530,35 @@ def page_chart(cfg, book):
         except Exception as exc:
             st.error(f"加载失败：{exc}")
             return
-        if df.attrs.get("adjust") == "none":
-            st.info("当前是**不复权**价格。跑一次 `--xdxr` 后才是前复权。")
-        for w in r.warnings():
-            st.warning(w)
-        _draw_kline(r.df.tail(days), code)
-        C.defense_coverage_chips(defense_coverage(r.df))
+        st.session_state["chart"] = (code, r, df.attrs.get("adjust"), days)
 
+    got = st.session_state.get("chart")
+    if got is None:
+        C.empty_state("输入代码查看", "会画出全部指标，并统计每种信号历史触发了多少次。")
+        return
+    code, r, adjust, days = got
+    if adjust == "none":
+        st.info("当前是**不复权**价格。跑一次 `sync --xdxr` 后才是前复权。")
+    for w in r.warnings():
+        st.warning(w)
+
+    left, right = st.columns([7, 3], gap="medium")
+    with left:
+        _draw_kline(r.df.tail(days), code, height=560)
+    with right:
+        from zhixing_quant.indicators.pipeline import defense_coverage
+        st.markdown("**防守规则覆盖**")
+        C.defense_coverage_chips(defense_coverage(r.df))
         sig_cols = [c2 for c2 in r.df.columns if c2.startswith("sig_")]
         hits = {c2: int(r.df[c2].fillna(False).astype(bool).sum()) for c2 in sig_cols}
         hits = {k: v for k, v in hits.items() if v}
+        st.markdown("**历史信号统计**")
         if hits:
-            C.section("历史信号统计", f"最近 {len(r.df)} 根K线")
-            st.dataframe(pd.DataFrame([{"信号": k, "触发次数": v} for k, v in
+            st.dataframe(pd.DataFrame([{"信号": k, "次数": v} for k, v in
                                        sorted(hits.items(), key=lambda x: -x[1])]),
-                         use_container_width=True, hide_index=True)
+                         use_container_width=True, hide_index=True, height=380)
+        else:
+            st.caption("这段历史里没有任何信号触发。")
 
 
 def page_data(cfg, book):
@@ -466,15 +592,13 @@ def page_data(cfg, book):
 
 
 # ---------------------------------------------------------------------------
-# K线
-# ---------------------------------------------------------------------------
 
-def _draw_kline(df: pd.DataFrame, title: str = ""):
+def _draw_kline(df: pd.DataFrame, title: str = "", height: int = 640):
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
     from zhixing_quant.indicators.tdx import ma
-    from zhixing_quant.ui.theme import DOWN, UP
+    from zhixing_quant.ui.theme import DOWN, TEXT_3, UP
 
     d = df.copy()
     x = d.index.strftime("%Y-%m-%d")
@@ -483,8 +607,8 @@ def _draw_kline(df: pd.DataFrame, title: str = ""):
                         row_heights=[.62, .18, .20] if sub else [.75, .25],
                         vertical_spacing=.03)
     fig.add_trace(go.Candlestick(x=x, open=d["open"], high=d["high"], low=d["low"],
-                                 close=d["close"], name="K线", **candlestick_colors()),
-                  row=1, col=1)
+                                 close=d["close"], name="K线",
+                                 **candlestick_colors()), row=1, col=1)
     fig.add_trace(go.Scatter(x=x, y=ma(d["close"], 20), name="MA20",
                              line=dict(width=1.2, color=MA_FAST)), row=1, col=1)
     if "yellow_line" in d.columns:
@@ -492,16 +616,16 @@ def _draw_kline(df: pd.DataFrame, title: str = ""):
                                  line=dict(width=1.8, color=SIGNAL_LINE)), row=1, col=1)
     if "white_line" in d.columns:
         fig.add_trace(go.Scatter(x=x, y=d["white_line"], name="白线",
-                                 line=dict(width=1, color="#8A93A0")), row=1, col=1)
-    for col, mark, color in (("sig_brick", "triangle-up", UP), ("sig_b1", "triangle-up", UP),
-                             ("sig_strategy", "triangle-up", UP)):
+                                 line=dict(width=1, color=TEXT_3)), row=1, col=1)
+    for col in ("sig_strategy", "sig_brick", "sig_b1", "sig_b2"):
         if col in d.columns:
             hit = d[d[col].fillna(False).astype(bool)]
             if not hit.empty:
                 fig.add_trace(go.Scatter(x=hit.index.strftime("%Y-%m-%d"),
-                                         y=hit["low"] * .97, mode="markers", name="信号",
-                                         marker=dict(symbol=mark, size=11, color=color)),
-                              row=1, col=1)
+                                         y=hit["low"] * .97, mode="markers",
+                                         name="买点",
+                                         marker=dict(symbol="triangle-up", size=11,
+                                                     color=UP)), row=1, col=1)
                 break
     fig.add_trace(go.Bar(x=x, y=d["vol"], name="成交量",
                          marker_color=[UP if c >= o else DOWN
@@ -511,11 +635,9 @@ def _draw_kline(df: pd.DataFrame, title: str = ""):
         fig.add_trace(go.Bar(x=x, y=d["brick_value"], name="砖型图",
                              marker_color=[UP if v >= 0 else DOWN
                                            for v in d["brick_value"]]), row=3, col=1)
-    apply_layout(fig, height=680, title=title)
+    apply_layout(fig, height=height, title="")
     st.plotly_chart(fig, use_container_width=True)
 
-
-# ---------------------------------------------------------------------------
 
 PAGES = {"今日": page_today, "持仓": page_positions, "战法": page_strategies,
          "回测": page_backtest, "个股": page_chart, "数据": page_data}
@@ -523,12 +645,23 @@ PAGES = {"今日": page_today, "持仓": page_positions, "战法": page_strategi
 
 def main():
     cfg = get_config()
+    if "page" not in st.session_state:
+        st.session_state["page"] = "今日"
+
     st.sidebar.markdown(
-        "<div style='padding:0 4px 14px'><b style='font-size:16px'>知行</b></div>",
+        "<div style='padding:2px 4px 12px;font-size:16px;font-weight:600'>知行</div>",
         unsafe_allow_html=True)
-    book = st.sidebar.radio("账户", list(BOOKS), format_func=BOOKS.get,
-                            horizontal=True, label_visibility="collapsed")
-    page = st.sidebar.radio("页面", list(PAGES), label_visibility="collapsed")
+    book = st.sidebar.segmented_control(
+        "账户", list(BOOKS), format_func=BOOKS.get, default="swing",
+        label_visibility="collapsed") or "swing"
+    st.sidebar.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+    for name in PAGE_ORDER:
+        active = st.session_state["page"] == name
+        if st.sidebar.button(name, key=f"nav_{name}", use_container_width=True,
+                             type="primary" if active else "secondary"):
+            st.session_state["page"] = name
+            st.rerun()
 
     h = _health()
     if h.get("ok"):
@@ -553,7 +686,7 @@ def main():
     else:
         st.sidebar.error("数据未就绪")
 
-    PAGES[page](cfg, book)
+    PAGES[st.session_state["page"]](cfg, book)
 
 
 if __name__ == "__main__":

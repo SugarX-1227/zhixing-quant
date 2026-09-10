@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pandas as pd
 
-from zhixing_quant.indicators.tdx import hhv, llv, ma, ref
+from zhixing_quant.indicators.tdx import (hhv, llv, ma, ref, zhixing_white,
+                                          zhixing_yellow)
 
 
 def detect_key_k(df: pd.DataFrame, atr_window: int = 14, lookback: int = 60) -> pd.DataFrame:
@@ -100,9 +101,12 @@ def detect_key_k(df: pd.DataFrame, atr_window: int = 14, lookback: int = 60) -> 
     out["k_hammer"] = (lower_shadow >= body * 2) & (upper_shadow <= body * 0.5)
 
     # 4 position flags
-    yellow = _avg_ma(close)
+    # 白线是 EMA(EMA(C,10),10)，不是 MA(C,10)。这里原来是全项目第三个
+    # 互不相同的白线定义，现已统一到 tdx.zhixing_white。
+    yellow = zhixing_yellow(close)
+    white = zhixing_white(close)
     out["near_yellow_line"] = (close - yellow).abs() / yellow <= 0.02
-    out["near_white_line"] = (close - ma(close, 10)).abs() / ma(close, 10) <= 0.02
+    out["near_white_line"] = (close - white).abs() / white <= 0.02
 
     box_high = hhv(high, 20).shift(1)
     box_low = llv(low, 20).shift(1)
@@ -137,7 +141,5 @@ def ma(series: pd.Series, n: int) -> pd.Series:
 
 
 def _avg_ma(close: pd.Series) -> pd.Series:
-    """知行多空线: average of MA(14), MA(28), MA(57), MA(114)."""
-    windows = [14, 28, 57, 114]
-    lines = [ma(close, w) for w in windows]
-    return sum(lines) / len(lines)
+    """知行多空线。保留此名以兼容旧调用，实现已收敛到 tdx.zhixing_yellow。"""
+    return zhixing_yellow(close)

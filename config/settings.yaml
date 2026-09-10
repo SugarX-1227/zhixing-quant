@@ -44,8 +44,11 @@ report:
 brick:
   n1: 4
   n2: 6
-  yellow_ma_windows: [14, 28, 57, 114]
-  min_height_ratio: 0.6666666667
+  # 绿转强红（附录 B.5）：砖高 > 4 且 砖高 > 昨日砖高 × 1.5。
+  # 原 min_height_ratio: 0.6667 是课程口语"覆盖前一根绿柱 2/3"的误读，
+  # 拿今日涨幅比昨日跌幅，且缺了"砖高 > 4"这道防微红盘的门槛，已移除。
+  min_brick_height: 4.0
+  min_brick_growth: 1.5
   take_profit:
     red_streak_2: 0.10
     red_streak_3: 0.30
@@ -55,14 +58,14 @@ brick:
     break_yellow_line: true
 
 b1:
-  yellow_ma_windows: [14, 28, 57, 114]
+  # 黄线参数见 dual_line 段，此处不再重复声明
   rsi_n: 9
   j_threshold: 13
   chg_min: -4
   chg_max: 4
 
 b2:
-  yellow_ma_windows: [14, 28, 57, 114]
+  # 黄线参数见 dual_line 段，此处不再重复声明
   rsi_n: 9
   exist_window: 3
   j_oversold: 13
@@ -82,9 +85,13 @@ key_kline:
   atr_window: 14
   lookback: 60
 
+# 知行双线。全项目唯一定义，brick / b1 / b2 / key_kline / defense 都读这里。
+# 附录 B.1：白线 = EMA(EMA(C,10),10)，黄线 = (MA14+MA28+MA57+MA114)/4。
+# 曾经错写成 fast:10 / slow:20（单条 EMA10 与 MA20），导致防守层用 MA20
+# 当生死线，破线次数多出四成。改这两个值等于换掉整套体系的骨架，慎动。
 dual_line:
-  fast: 10
-  slow: 20
+  white_span: 10
+  yellow_ma_windows: [14, 28, 57, 114]
 
 single_needle:
   n1: 10

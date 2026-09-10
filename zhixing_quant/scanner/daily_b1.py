@@ -14,7 +14,7 @@ SPEC = StrategySpec(
     label="B1",
     signal_col="sig_b1",
     add_indicators=add_b1_indicators,
-    min_bars=lambda cfg: max(cfg["b1"]["yellow_ma_windows"]),
+    min_bars=lambda cfg: max(cfg["dual_line"]["yellow_ma_windows"]),
     extra_fields=lambda r: {
         "yellow_line": float(r["yellow_line"]),
         "kdj_j": float(r["kdj_j"]),

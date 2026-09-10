@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from zhixing_quant.indicators.tdx import average_ma, exist, hhv, llv, ref, sma_tdx
+from zhixing_quant.indicators.tdx import (attach_zhixing_lines, exist, hhv, llv, ref, sma_tdx)
 
 
 def add_b2_indicators(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
@@ -31,7 +31,7 @@ def add_b2_indicators(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     low = out["low"]
     vol = out["vol"]
 
-    out["yellow_line"] = average_ma(close, cfg["b2"]["yellow_ma_windows"])
+    attach_zhixing_lines(out, cfg)
 
     n = int(cfg["b2"]["rsi_n"])
     rng = hhv(high, n) - llv(low, n)

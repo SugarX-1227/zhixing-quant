@@ -89,12 +89,8 @@ def run_backtest(
             f"而回测引擎读的是预先算好的信号列。目前支持：{', '.join(BACKTESTABLE)}"
         )
 
-    warnings: List[str] = []
     as_of = universe_as_of or start
-    if as_of > start:
-        warnings.append(
-            f"建池基准日 {as_of} 晚于回测开始日 {start}，结果含前视偏差，不可用于决策。"
-        )
+    warnings: List[str] = check_universe_as_of(as_of, start)
 
     uni = build_universe(cfg, as_of=as_of, spec=spec)
     if not uni.codes:
@@ -105,31 +101,53 @@ def run_backtest(
     raw = load_daily_many(uni.codes, start_date=warm, end_date=end)
 
     data: Dict[str, pd.DataFrame] = {}
-    skipped = 0
+    short_history = 0
+    errors: Dict[str, str] = {}          # code -> 错误摘要，不再静默吞掉
     total = len(uni.codes)
     for i, code in enumerate(uni.codes, 1):
         df = raw.get(code)
         if df is None or len(df) < 130:
-            skipped += 1
+            short_history += 1
             continue
         try:
             data[code] = run_pipeline(df, cfg, strategy).df
-        except Exception:
-            skipped += 1
+        except Exception as exc:
+            errors[code] = f"{type(exc).__name__}: {exc}"
         if progress is not None and i % 25 == 0:
             progress(i, total)
 
+    skipped = short_history + len(errors)
+
+    if errors:
+        # 按错误类型归并，避免 200 条一模一样的信息刷屏
+        kinds: Dict[str, int] = {}
+        for msg in errors.values():
+            kinds[msg] = kinds.get(msg, 0) + 1
+        top = sorted(kinds.items(), key=lambda kv: -kv[1])[:3]
+        detail = "；".join(f"{msg}（{n} 只）" for msg, n in top)
+        warnings.append(f"{len(errors)} 只标的指标计算失败，已剔除：{detail}")
+
     if not data:
-        raise ValueError("池内标的的K线都不足 130 根，无法计算指标。")
+        raise ValueError(
+            f"池内 {total} 只标的没有一只能算出指标。"
+            f"K线不足 130 根 {short_history} 只，指标报错 {len(errors)} 只。"
+            + (f" 首个错误：{next(iter(errors.values()))}" if errors else "")
+        )
 
     engine = BacktestEngine(cfg)
     result = engine.run(data, signal_col=sig_col, start_date=start, end_date=end)
 
-    bench = _load_benchmark(benchmark_code, start, end, result.equity_curve)
+    bench, bench_used = _load_benchmark(benchmark_code, start, end,
+                                        result.equity_curve)
     if bench is None:
         warnings.append(
-            f"库里没有基准指数 {benchmark_code}，无法判断收益是超额还是跟着大盘涨。"
-            "把指数加进 sync 的同步范围后重跑。"
+            f"库里没有基准指数 {benchmark_code}，也没有任何可用的备选指数，"
+            "无法判断收益是超额还是跟着大盘涨。把指数加进 sync 的同步范围后重跑。"
+        )
+    elif bench_used != benchmark_code:
+        warnings.append(
+            f"库里没有 {benchmark_code}，已改用 {bench_used} 作基准。"
+            f"下面的超额收益是相对 {bench_used} 算的，不是 {benchmark_code}。"
         )
 
     return BacktestRun(
@@ -145,12 +163,51 @@ def run_backtest(
     )
 
 
+def check_universe_as_of(as_of: str, start: str) -> List[str]:
+    """建池基准日不得晚于回测开始日。
+
+    抽成纯函数是为了能测。这条判据一旦失效，回测收益会被系统性抬高，
+    而且抬多少无法估计——不会有任何测试因此变红。
+
+    Args:
+        as_of / start: YYYYMMDD 字符串（定长，可直接字典序比较）。
+
+    Returns:
+        告警列表，为空表示时点正确。
+    """
+    if str(as_of) > str(start):
+        return [f"建池基准日 {as_of} 晚于回测开始日 {start}，"
+                f"等于让开始那天就知道后面谁最活跃。结果含前视偏差，不可用于决策。"]
+    return []
+
+
+# 允许的基准候选。顺序即优先级，全是指数代码，不含任何个股。
+BENCHMARK_FALLBACKS = ("sh000300", "sh000905", "sh000001", "sz399001")
+
+
 def _load_benchmark(code: str, start: str, end: str,
-                    equity: pd.Series) -> Optional[pd.Series]:
-    """加载基准指数并归一到与权益曲线同一起点。"""
+                    equity: pd.Series) -> tuple[Optional[pd.Series], Optional[str]]:
+    """加载基准指数并归一到与权益曲线同一起点。
+
+    ⚠️ 原实现的候选链是 `(code, "sh000001", "000001")`，有两个问题：
+
+    1. 请求 sh000300 而库里没有时，会**静默**换成上证指数返回。调用方那边
+       只在 bench 为 None 时才告警，而 fallback 保证了它几乎不会是 None——
+       于是界面上照常画出一条"基准"曲线和一个超额收益数字，
+       而你不知道自己比的到底是沪深300还是上证。
+    2. 最后那个 `"000001"` 是 6 位代码，在本地库里是**平安银行**
+       （上证指数存的是 sh000001，见 data/sync.py 的注释）。也就是说
+       最坏情况下会拿一只银行股的股价当大盘基准算超额收益。
+
+    现在候选链只含指数，并且把实际用到的代码回传给调用方去告警。
+
+    Returns:
+        (归一化后的基准序列, 实际使用的代码)。两者都可能为 None。
+    """
     from zhixing_quant.data.tdx_loader import load_daily
 
-    for candidate in (code, "sh000001", "000001"):
+    candidates = [code] + [c for c in BENCHMARK_FALLBACKS if c != code]
+    for candidate in candidates:
         try:
             df = load_daily(candidate, start_date=start, end_date=end, adjust="")
         except Exception:
@@ -163,8 +220,8 @@ def _load_benchmark(code: str, start: str, end: str,
             if s.empty:
                 continue
             s = s / s.iloc[0] * float(equity.iloc[0])
-        return s
-    return None
+        return s, candidate
+    return None, None
 
 
 def compare_strategies(cfg: dict, strategies: List[str], start: str, end: str,

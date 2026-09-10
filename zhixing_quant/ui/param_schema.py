@@ -39,8 +39,10 @@ STRATEGY_PARAMS: Dict[str, List[Param]] = {
               "砖型图快线周期"),
         Param("brick.n2", "长周期 N2", "int", 6, 3, 20, 1,
               "砖型图慢线周期"),
-        Param("brick.min_height_ratio", "红柱高度比", "float", 0.6667, 0.2, 1.5, 0.05,
-              "今日红柱高度 ÷ 昨日绿柱高度 的下限。调低更容易命中"),
+        Param("brick.min_brick_height", "砖高绝对下限", "float", 4.0, 0.0, 20.0, 0.5,
+              "附录 B.5 的「砖型图 > 4」。调低会放行贴地的微红盘"),
+        Param("brick.min_brick_growth", "砖高增长倍数", "float", 1.5, 1.0, 3.0, 0.1,
+              "今日砖高 ÷ 昨日砖高 的下限。附录 B.5 给 1.5"),
     ],
     "b1": [
         Param("b1.j_threshold", "J值上限", "float", 13.0, 0.0, 40.0, 1.0,
@@ -61,8 +63,11 @@ STRATEGY_PARAMS: Dict[str, List[Param]] = {
         Param("b2.j_threshold", "当日 J值上限", "float", 55.0, 20.0, 100.0, 5.0),
     ],
     "dual_line": [
-        Param("dual_line.fast", "白线周期", "int", 10, 3, 30, 1),
-        Param("dual_line.slow", "黄线周期", "int", 20, 5, 60, 1),
+        # 白线 EMA(EMA(C,10),10) 的周期。黄线的 [14,28,57,114] 是附录 B.1 的
+        # 原始定义，不作为可调项暴露——改它等于换掉整套体系的骨架，
+        # 而界面上一个滑块看不出这个分量。
+        Param("dual_line.white_span", "白线 EMA 周期", "int", 10, 3, 30, 1,
+              "白线 = EMA(EMA(C,N),N)，二次平滑。规格给 10", tag="LOCKED"),
         Param("volume_price.vol_ma_window", "量均线周期", "int", 5, 3, 20, 1),
     ],
     "yoga_pants": [

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pandas as pd
 
-from zhixing_quant.indicators.tdx import average_ma, ema, hhv, llv, ref, sma_tdx
+from zhixing_quant.indicators.tdx import (attach_zhixing_lines, hhv, llv, ref,
+                                          sma_tdx)
 
 
 def add_b1_indicators(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
@@ -27,8 +28,12 @@ def add_b1_indicators(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     high = out["high"]
     low = out["low"]
 
-    yellow_line = average_ma(close, cfg["b1"]["yellow_ma_windows"])
-    short_trend = ema(ema(close, 10), 10)
+    # 双线统一由 tdx.attach_zhixing_lines 算，不在这里自己拼。
+    # 以前这里算对了、dual_line.py 算错了，两边都写 yellow_line，
+    # 流水线里后者覆盖前者，进攻和防守跑在两条不同的线上。
+    attach_zhixing_lines(out, cfg)
+    yellow_line = out["yellow_line"]
+    short_trend = out["white_line"]
 
     n = int(cfg["b1"]["rsi_n"])
     rng = hhv(high, n) - llv(low, n)
@@ -41,14 +46,12 @@ def add_b1_indicators(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
 
     pct_chg = (close / ref(close, 1) - 1) * 100
 
-    out["yellow_line"] = yellow_line
-    out["short_trend"] = short_trend
+    out["short_trend"] = short_trend      # 保留旧列名，语义同 white_line
     out["kdj_k"] = k
     out["kdj_d"] = d
     out["kdj_j"] = j
     out["pct_chg"] = pct_chg
-    out["above_yellow"] = close > yellow_line
-    out["trend_above_yellow"] = short_trend > yellow_line
+    out["trend_above_yellow"] = out["regime_strong"]
     out["sig_b1"] = (
         (j < float(cfg["b1"]["j_threshold"]))
         & out["above_yellow"]

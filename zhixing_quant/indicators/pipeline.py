@@ -66,10 +66,8 @@ def _step_b2(df, cfg):
 
 
 def _step_dual_line(df, cfg):
-    """签名是 (df, fast, slow) 位置标量，不是 (df, cfg)。"""
     from zhixing_quant.indicators.dual_line import add_dual_line
-    c = cfg.get("dual_line", {}) or {}
-    return add_dual_line(df, int(c.get("fast", 10)), int(c.get("slow", 20)))
+    return add_dual_line(df, cfg)
 
 
 def _step_macd(df, cfg):

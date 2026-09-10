@@ -18,18 +18,20 @@ SPEC = StrategySpec(
     label="砖型图",
     signal_col="sig_brick",
     add_indicators=add_brick_indicators,
-    min_bars=lambda cfg: max(cfg["brick"]["yellow_ma_windows"]),
+    min_bars=lambda cfg: max(cfg["dual_line"]["yellow_ma_windows"]),
     extra_fields=lambda r: {
         "yellow_line": float(r["yellow_line"]),
         "brick_value": float(r["brick_value"]),
         "brick_red_height": float(r["brick_red_height"]),
-        "brick_green_height": float(r["brick_green_height"]),
+        "brick_prev_height": float(r["brick_prev_height"]),
         "red_streak": int(r["red_streak"]),
         "stop_loss": float(r["stop_loss"]),
         "abandon_gap_up_price": float(r["abandon_gap_up_price"]),
     },
     reason=lambda r, cfg: (
-        "昨天绿柱 + 今天红柱 + 红柱高度达到昨日绿柱2/3 + 收盘站上知行多空线"
+        f"绿转强红：砖高{float(r['brick_value']):.1f}>4"
+        f" 且 >昨砖{float(r['brick_prev_height']):.1f}×1.5"
+        f" + 收盘站上知行多空线"
     ),
 )
 

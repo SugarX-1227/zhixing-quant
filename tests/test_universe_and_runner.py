@@ -265,3 +265,119 @@ def test_scanner_extra_fields_columns_are_produced():
         row = out.iloc[-1]
         spec.extra_fields(row)          # 缺列会在这里 KeyError
         spec.reason(row, cfg)           # 文案里引用的列也一并验
+
+
+def test_collect_universe_pools_rebuilds_each_quarter(monkeypatch):
+    import pandas as pd
+
+    from zhixing_quant.backtest import runner
+    from zhixing_quant.data.universe import UniverseResult, UniverseSpec, rebalance_dates
+
+    seen = []
+
+    def fake_build_universe(cfg, as_of=None, spec=None):
+        seen.append(as_of)
+        return UniverseResult(
+            codes=[f"c{as_of}"],
+            frame=pd.DataFrame({"code": [f"c{as_of}"]}),
+            as_of=int(as_of),
+            spec=UniverseSpec(),
+        )
+
+    monkeypatch.setattr(runner, "build_universe", fake_build_universe)
+    last, codes, pools = runner.collect_universe_pools({}, "20240102", "20241231")
+    assert seen == rebalance_dates("20240102", "20241231", 3)
+    assert len(pools) == 4
+    assert len(codes) == 4
+    assert last.codes == ["c20241002"]
+
+
+def test_mask_signals_outside_membership():
+    import pandas as pd
+
+    from zhixing_quant.backtest.runner import mask_signals_by_membership
+
+    idx = pd.bdate_range("2024-01-02", periods=6)
+    df_a = pd.DataFrame({"sig_b1": [True] * 6, "close": [10] * 6}, index=idx)
+    df_b = pd.DataFrame({"sig_b1": [True] * 6, "close": [10] * 6}, index=idx)
+    pools = [
+        ("20240102", {"A"}),
+        ("20240108", {"B"}),
+    ]
+    out = mask_signals_by_membership(
+        {"A": df_a, "B": df_b}, "sig_b1", pools, "20240112",
+    )
+    assert out["A"]["sig_b1"].tolist() == [True, True, True, True, False, False]
+    assert out["B"]["sig_b1"].tolist() == [False, False, False, False, True, True]
+
+
+def _seed_universe_store(store):
+    import pandas as pd
+
+    dates = [20230601, 20250601, 20260909]
+    def bars(amount=1e8):
+        n = len(dates)
+        return pd.DataFrame({
+            "trade_date": dates,
+            "open": [10.0] * n, "high": [11.0] * n, "low": [9.0] * n,
+            "close": [10.0] * n, "amount": [amount] * n, "vol": [1e6] * n,
+        })
+    store.upsert_bars("sh000001", bars())
+    store.upsert_bars("600000", bars(3e8))
+    store.upsert_bars("600001", bars(2e8))
+    store.upsert_bars("600002", bars(2.5e8))
+    store.upsert_securities([
+        ("sh000001", "上证指数", "sh", "INDEX"),
+        ("600000", "浦发银行", "sh", "MAIN"),
+        ("600001", "*ST假票", "sh", "MAIN"),
+        ("600002", "正常票", "sh", "MAIN"),
+    ])
+
+
+def test_build_universe_does_not_drop_today_st_from_history(tmp_path, monkeypatch):
+    """今天叫 *ST 的票，不能从 2023 年的池子里提前踢掉。"""
+    from zhixing_quant.data.store import BarStore
+    from zhixing_quant.data.universe import UniverseSpec, build_universe
+    from zhixing_quant.data import tdx_loader
+
+    store = BarStore(tmp_path / "uni.db")
+    _seed_universe_store(store)
+    monkeypatch.setattr(tdx_loader, "get_store", lambda: store)
+
+    spec = UniverseSpec(boards=("MAIN",), size=None, min_amount=0,
+                        exclude_st=True, min_listed_bars=0)
+    uni = build_universe({}, as_of="20230601", spec=spec)
+    assert "600001" in uni.codes, "用今天的 *ST 名字前视了"
+    assert "600000" in uni.codes
+    assert uni.warnings and "跳过 ST 过滤" in uni.warnings[0]
+    store.close()
+
+
+def test_build_universe_uses_historical_st_name(tmp_path, monkeypatch):
+    from zhixing_quant.data.store import BarStore
+    from zhixing_quant.data.universe import UniverseSpec, build_universe
+    from zhixing_quant.data import tdx_loader
+
+    store = BarStore(tmp_path / "uni2.db")
+    _seed_universe_store(store)
+    store.record_name_history([
+        ("600000", "浦发银行"),
+        ("600001", "还没戴帽"),
+        ("600002", "*ST当时"),
+    ], 20230601)
+    store.record_name_history([
+        ("600000", "浦发银行"),
+        ("600001", "*ST假票"),
+        ("600002", "正常票"),
+    ], 20260909)
+    monkeypatch.setattr(tdx_loader, "get_store", lambda: store)
+
+    spec = UniverseSpec(boards=("MAIN",), size=None, min_amount=0,
+                        exclude_st=True, min_listed_bars=0)
+    past = build_universe({}, as_of="20230601", spec=spec)
+    assert "600002" not in past.codes
+    assert "600001" in past.codes
+    now = build_universe({}, as_of="20260909", spec=spec)
+    assert "600001" not in now.codes
+    assert "600002" in now.codes
+    store.close()

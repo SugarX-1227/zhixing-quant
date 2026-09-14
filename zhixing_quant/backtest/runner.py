@@ -16,7 +16,7 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
-from zhixing_quant.data.universe import UniverseSpec, build_universe
+from zhixing_quant.data.universe import UniverseSpec, build_universe, rebalance_dates
 
 # 回测引擎读的是预先算好的信号列，只有这几套战法能提供
 BACKTESTABLE = {
@@ -79,7 +79,9 @@ def run_backtest(
         BacktestRun
     """
     from zhixing_quant.backtest.engine import BacktestEngine
-    from zhixing_quant.data.tdx_loader import load_daily, load_daily_many
+    from zhixing_quant.data.tdx_loader import (
+        get_store, load_daily_many, survivorship_warnings,
+    )
     from zhixing_quant.indicators.pipeline import run_pipeline
 
     sig_col = BACKTESTABLE.get(strategy)
@@ -92,19 +94,22 @@ def run_backtest(
     as_of = universe_as_of or start
     warnings: List[str] = check_universe_as_of(as_of, start)
 
-    uni = build_universe(cfg, as_of=as_of, spec=spec)
-    if not uni.codes:
+    uni, codes, pools = collect_universe_pools(
+        cfg, as_of, end, spec=spec, months=3,
+    )
+    warnings.extend(uni.warnings)
+    if not codes:
         raise ValueError(f"按 {as_of} 的条件筛不出任何标的，放宽建池条件试试。")
 
     # 指标需要预热，黄线含 MA114
     warm = (pd.Timestamp(start) - pd.Timedelta(days=400)).strftime("%Y%m%d")
-    raw = load_daily_many(uni.codes, start_date=warm, end_date=end)
+    raw = load_daily_many(codes, start_date=warm, end_date=end)
 
     data: Dict[str, pd.DataFrame] = {}
     short_history = 0
     errors: Dict[str, str] = {}          # code -> 错误摘要，不再静默吞掉
-    total = len(uni.codes)
-    for i, code in enumerate(uni.codes, 1):
+    total = len(codes)
+    for i, code in enumerate(codes, 1):
         df = raw.get(code)
         if df is None or len(df) < 130:
             short_history += 1
@@ -134,8 +139,12 @@ def run_backtest(
             + (f" 首个错误：{next(iter(errors.values()))}" if errors else "")
         )
 
+    data = mask_signals_by_membership(data, sig_col, pools, end)
+
     engine = BacktestEngine(cfg)
     result = engine.run(data, signal_col=sig_col, start_date=start, end_date=end)
+
+    warnings.extend(survivorship_warnings(get_store()))
 
     bench, bench_used = _load_benchmark(benchmark_code, start, end,
                                         result.equity_curve)
@@ -155,12 +164,73 @@ def run_backtest(
         equity_curve=result.equity_curve,
         trades=result.trades_frame(),
         benchmark=bench,
-        universe_note=f"{uni.spec.describe()}｜{uni.summary()}",
-        universe_codes=uni.codes,
+        universe_note=(
+            f"{uni.spec.describe()}｜滚动建池 {len(pools)} 次，合计 {len(codes)} 只"
+        ),
+        universe_codes=codes,
         loaded=len(data),
         skipped=skipped,
         warnings=warnings,
     )
+
+
+
+def collect_universe_pools(
+    cfg: dict,
+    start: str,
+    end: str,
+    spec: Optional[UniverseSpec] = None,
+    months: int = 3,
+) -> tuple:
+    """按季度（默认）滚动建池。months=0 则只在 start 建一次。"""
+    dates = rebalance_dates(start, end, months=months) if months else [str(start)]
+    pools = []
+    codes: List[str] = []
+    seen = set()
+    last = None
+    for d in dates:
+        last = build_universe(cfg, as_of=d, spec=spec)
+        pools.append((d, set(last.codes)))
+        for code in last.codes:
+            if code not in seen:
+                seen.add(code)
+                codes.append(code)
+    if last is None:
+        raise ValueError(f"按 {start} 的条件筛不出任何标的，放宽建池条件试试。")
+    return last, codes, pools
+
+
+def mask_signals_by_membership(
+    data: Dict[str, pd.DataFrame],
+    sig_col: str,
+    pools: List[tuple],
+    end: str,
+) -> Dict[str, pd.DataFrame]:
+    """池外日期的买入信号关掉。已有持仓仍由引擎按止损/止盈处理。"""
+    if not pools or len(pools) == 1:
+        return data
+    bounds = []
+    for i, (d, members) in enumerate(pools):
+        lo = pd.Timestamp(d)
+        hi = (pd.Timestamp(pools[i + 1][0]) if i + 1 < len(pools)
+              else pd.Timestamp(end) + pd.Timedelta(days=1))
+        bounds.append((lo, hi, members))
+    out: Dict[str, pd.DataFrame] = {}
+    for code, df in data.items():
+        if sig_col not in df.columns:
+            out[code] = df
+            continue
+        eligible = pd.Series(False, index=df.index)
+        for lo, hi, members in bounds:
+            if code in members:
+                eligible |= (df.index >= lo) & (df.index < hi)
+        if bool(eligible.all()):
+            out[code] = df
+            continue
+        copied = df.copy()
+        copied.loc[~eligible, sig_col] = False
+        out[code] = copied
+    return out
 
 
 def check_universe_as_of(as_of: str, start: str) -> List[str]:

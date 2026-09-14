@@ -13,7 +13,8 @@
 这是前视偏差叠加幸存者偏差，会系统性地把回测收益抬高，且抬多少无法估计。
 
 本模块的 build_universe 强制传入 as_of 日期，只用那一天及之前的信息选股：
-- 成交额、涨跌、名称（ST 与否）都取 as_of 当天的快照
+- 成交额、涨跌取 as_of 当天的快照
+- ST / 退市只用 as_of 当时可知的名称；没有名称历史时宁可不滤，也不拿今天的名字前视
 - 上市天数按 as_of 之前的 K 线根数算，不是全库总根数
 - 板块归属是静态属性，不受时点影响
 
@@ -70,6 +71,7 @@ class UniverseResult:
     as_of: int
     spec: UniverseSpec
     dropped: Dict[str, int] = field(default_factory=dict)
+    warnings: List[str] = field(default_factory=list)
 
     def summary(self) -> str:
         d = "、".join(f"{k} {v} 只" for k, v in self.dropped.items() if v)
@@ -100,6 +102,7 @@ def build_universe(
 
     df = spot.copy()
     dropped: Dict[str, int] = {}
+    warnings: List[str] = []
 
     def cut(mask, label):
         nonlocal df
@@ -115,10 +118,15 @@ def build_universe(
     cut(df["code"].map(lambda c: boards.get(c, "MAIN")).isin(keep), "板块不符")
 
     if spec.exclude_st:
-        names = df["name"].astype(str)
-        if (names.str.len() > 0).any():
-            cut(~names.str.upper().str.contains("ST") & ~names.str.contains("退"),
-                "ST/退市")
+        from zhixing_quant.data.tdx_loader import names_for_st_filter, st_like
+        name_map, st_warn = names_for_st_filter(store, trade_date)
+        if st_warn:
+            warnings.append(st_warn)
+        if name_map:
+            names = df["code"].map(lambda c: name_map.get(str(c), "")).astype(str)
+            df = df.copy()
+            df["name"] = names
+            cut(~names.map(st_like), "ST/退市")
 
     if spec.min_amount:
         cut(df["amount"] >= float(spec.min_amount), "成交额不足")
@@ -150,7 +158,8 @@ def build_universe(
         df = pd.concat([df, extra], ignore_index=True)
 
     return UniverseResult(codes=df["code"].astype(str).tolist(), frame=df,
-                          as_of=trade_date, spec=spec, dropped=dropped)
+                          as_of=trade_date, spec=spec, dropped=dropped,
+                          warnings=warnings)
 
 
 def spec_from_config(cfg: dict) -> UniverseSpec:

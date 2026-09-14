@@ -115,7 +115,8 @@ def sync_daily(
         wanted = [e for e in wanted if e["key"] in keep or e["code"] in keep]
 
     store = BarStore(db_path(cfg))
-    states = {} if full else store.get_all_sync_states()
+    prev_states = store.get_all_sync_states()
+    states = {} if full else prev_states
 
     total_new = 0
     touched = 0
@@ -180,6 +181,13 @@ def sync_daily(
         ]
     )
     store.set_meta("last_sync", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    gone = [c for c in prev_states if c not in {e["key"] for e in wanted}]
+    if verbose and gone:
+        print(
+            f"  通达信目录里消失了 {len(gone)} 只（可能退市/摘牌），"
+            "库内已有 K 线保留，不会删。"
+        )
 
     elapsed = time.time() - t0
     stats = {

@@ -48,6 +48,13 @@ CREATE TABLE IF NOT EXISTS security (
     board  TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS security_name_hist (
+    code       TEXT    NOT NULL,
+    start_date INTEGER NOT NULL,
+    name       TEXT    NOT NULL,
+    PRIMARY KEY (code, start_date)
+);
+
 CREATE TABLE IF NOT EXISTS xdxr (
     code        TEXT NOT NULL,
     ex_date     INTEGER NOT NULL,
@@ -477,6 +484,85 @@ class BarStore:
 
     def load_securities(self) -> pd.DataFrame:
         return pd.read_sql_query("SELECT * FROM security", self.conn)
+
+    def market_date(self) -> Optional[int]:
+        """库内最新交易日。优先上证指数，没有再退到全表。"""
+        row = self.conn.execute(
+            "SELECT MAX(trade_date) AS d FROM daily_bar WHERE code = 'sh000001'"
+        ).fetchone()
+        if row is None or row["d"] is None:
+            row = self.conn.execute(
+                "SELECT MAX(trade_date) AS d FROM daily_bar"
+            ).fetchone()
+        return int(row["d"]) if row is not None and row["d"] is not None else None
+
+    def record_name_history(self, records: Sequence[tuple], as_of: int) -> int:
+        """名称变更才追加一行。as_of 是这批名字开始生效的日期。"""
+        as_of = int(as_of)
+        incoming = []
+        for item in records:
+            code = str(item[0])
+            name = str(item[1]).strip()
+            if code and name:
+                incoming.append((code, name))
+        if not incoming:
+            return 0
+        with self.transaction() as conn:
+            latest = {
+                r["code"]: r["name"]
+                for r in conn.execute(
+                    """
+                    SELECT h.code, h.name
+                    FROM security_name_hist h
+                    INNER JOIN (
+                        SELECT code, MAX(start_date) AS start_date
+                        FROM security_name_hist
+                        GROUP BY code
+                    ) t ON h.code = t.code AND h.start_date = t.start_date
+                    """
+                ).fetchall()
+            }
+            rows = [
+                (code, as_of, name)
+                for code, name in incoming
+                if latest.get(code) != name
+            ]
+            if not rows:
+                return 0
+            conn.executemany(
+                """
+                INSERT INTO security_name_hist (code, start_date, name)
+                VALUES (?, ?, ?)
+                ON CONFLICT(code, start_date) DO UPDATE SET name=excluded.name
+                """,
+                rows,
+            )
+        return len(rows)
+
+    def names_as_of(self, as_of: int) -> dict:
+        """每个 code 在 as_of 当天可知的最新名字。没有历史则返回空 dict。"""
+        rows = self.conn.execute(
+            """
+            SELECT h.code, h.name
+            FROM security_name_hist h
+            INNER JOIN (
+                SELECT code, MAX(start_date) AS start_date
+                FROM security_name_hist
+                WHERE start_date <= ?
+                GROUP BY code
+            ) t ON h.code = t.code AND h.start_date = t.start_date
+            """,
+            (int(as_of),),
+        ).fetchall()
+        return {r["code"]: r["name"] for r in rows}
+
+    def name_history_start(self) -> Optional[int]:
+        row = self.conn.execute(
+            "SELECT MIN(start_date) AS d FROM security_name_hist"
+        ).fetchone()
+        if row is None or row["d"] is None:
+            return None
+        return int(row["d"])
 
 
 def _empty_bar_frame() -> pd.DataFrame:

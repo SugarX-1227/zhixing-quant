@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import csv
 import struct
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -71,10 +72,12 @@ def update_names(cfg: dict, verbose: bool = True) -> int:
         board = prev["board"] if prev is not None else ""
         records.append((code, name, market, board))
     store.upsert_securities(records)
+    as_of = store.market_date() or int(datetime.now().strftime("%Y%m%d"))
+    store.record_name_history([(code, name) for code, name, _market, _board in records], as_of)
     store.close()
 
     if verbose:
-        print(f"  写入 {len(records)} 条股票名称")
+        print(f"  写入 {len(records)} 条股票名称（历史快照 {as_of}）")
     return len(records)
 
 

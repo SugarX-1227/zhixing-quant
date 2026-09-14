@@ -98,6 +98,66 @@ def fetch_a_spot(cache: bool = True, trade_date: Optional[str] = None) -> pd.Dat
     return spot
 
 
+def st_like(name: str) -> bool:
+    """当前名字是否带 ST / 退市标记。空字符串不算。"""
+    s = str(name).strip()
+    if not s:
+        return False
+    return "ST" in s.upper() or "退" in s
+
+
+def names_for_st_filter(store: BarStore, as_of: int) -> tuple:
+    """as_of 当天可知的名称。没有历史时，历史回测不会拿今天的名字滥杀。
+
+    Returns:
+        (code -> name, warning or None)
+    """
+    as_of = int(as_of)
+    hist = store.names_as_of(as_of)
+    if hist:
+        return hist, None
+    start = store.name_history_start()
+    market_max = store.market_date()
+    if start is not None and as_of < start:
+        return {}, (
+            f"名称历史从 {start} 才开始记录，建池日 {as_of} 早于该日，"
+            "已跳过 ST 过滤，避免用今天的名字把当年的正常票剔除。"
+        )
+    if start is None and market_max is not None and as_of < market_max:
+        return {}, (
+            f"没有 {as_of} 的名称历史，已跳过 ST 过滤，避免用今天的名字前视。"
+        )
+    sec = store.load_securities()
+    if sec.empty:
+        return {}, None
+    return {
+        str(r["code"]): str(r["name"])
+        for _, r in sec.iterrows()
+        if str(r["name"]).strip()
+    }, None
+
+
+def survivorship_warnings(store: BarStore) -> List[str]:
+    """通达信当前目录几乎只有仍在更新的股票时，提示幸存者偏差。"""
+    row = store.conn.execute(
+        "SELECT COUNT(*) AS n, MAX(last_date) AS mx FROM sync_state"
+    ).fetchone()
+    n = int(row["n"] or 0)
+    mx = row["mx"]
+    if n < 500 or mx is None:
+        return []
+    stale = int(store.conn.execute(
+        "SELECT COUNT(*) AS n FROM sync_state WHERE last_date < ?",
+        (int(mx),),
+    ).fetchone()["n"] or 0)
+    if stale / n >= 0.02:
+        return []
+    return [
+        f"通达信 vipdoc 几乎只有仍在更新的股票（{n} 只里仅 {stale} 只停更），"
+        "退市股不在本地库。回测存在幸存者偏差，收益会被系统性抬高。"
+    ]
+
+
 def filter_universe(spot: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     """按流动性 / ST / 次新 / 板块过滤股票池，按成交额降序。
 
@@ -106,27 +166,27 @@ def filter_universe(spot: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     """
     uni_cfg = cfg.get("universe", {})
     df = spot.copy()
+    store = get_store()
 
     min_amount = float(uni_cfg.get("min_daily_amount", 0) or 0)
     if min_amount > 0:
         df = df[df["amount"] >= min_amount]
 
-    if uni_cfg.get("exclude_st", True):
-        has_names = (df["name"].astype(str).str.len() > 0).any()
-        if has_names:
-            name = df["name"].astype(str).str.upper()
-            df = df[~name.str.contains("ST") & ~name.str.contains("退")]
-        # 名称缺失时不做 ST 过滤，由上层提示用户跑 --names
+    if uni_cfg.get("exclude_st", True) and not df.empty:
+        as_of = int(pd.Timestamp(df["date"].iloc[0]).strftime("%Y%m%d"))
+        name_map, _warn = names_for_st_filter(store, as_of)
+        if name_map:
+            names = df["code"].map(lambda c: name_map.get(str(c), "")).astype(str)
+            df = df[~names.map(st_like)]
+        # 没有时点名称时宁可不滤，也不用今天的 ST 名字前视
 
     # 指数永远不进股票池；其余板块由配置决定
     exclude_boards = set(uni_cfg.get("exclude_boards", []) or []) | {"INDEX"}
-    store = get_store()
     boards = store.load_securities().set_index("code")["board"].to_dict()
     df = df[~df["code"].map(lambda c: boards.get(c, "MAIN")).isin(exclude_boards)]
 
     new_days = int(uni_cfg.get("exclude_new_stock_days", 0) or 0)
     if new_days > 0:
-        store = get_store()
         counts = pd.read_sql_query(
             "SELECT code, COUNT(*) AS n FROM daily_bar GROUP BY code", store.conn
         ).set_index("code")["n"]
@@ -230,7 +290,7 @@ def data_health(cfg: Optional[dict] = None) -> dict:
         return {"ok": False, "message": str(exc)}
 
     stats = store.health_stats()
-    warnings: List[str] = []
+    warnings: List[str] = survivorship_warnings(store)
     if stats["named"] == 0:
         warnings.append("股票名称表为空，ST 过滤不生效。跑 `--names` 补上。")
     if stats["xdxr_codes"] == 0:

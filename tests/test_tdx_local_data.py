@@ -358,3 +358,44 @@ def test_qfq_preserves_amount():
     out = apply_qfq(df, xdxr)
     assert np.allclose(out["amount"].to_numpy(), df["amount"].to_numpy())
     assert out["vol"].iloc[0] > df["vol"].iloc[0]
+
+
+def test_name_history_is_point_in_time(tmp_path):
+    store = BarStore(tmp_path / "names.db")
+    store.record_name_history([("600001", "正常票")], 20230601)
+    store.record_name_history([("600001", "*ST假票")], 20250601)
+    assert store.names_as_of(20230501) == {}
+    assert store.names_as_of(20230601)["600001"] == "正常票"
+    assert store.names_as_of(20240101)["600001"] == "正常票"
+    assert store.names_as_of(20250601)["600001"] == "*ST假票"
+    assert store.name_history_start() == 20230601
+    # 名字没变不追加
+    n = store.record_name_history([("600001", "*ST假票")], 20260909)
+    assert n == 0
+    assert store.names_as_of(20260909)["600001"] == "*ST假票"
+    store.close()
+
+
+def test_st_like_detects_st_and_delist():
+    from zhixing_quant.data.tdx_loader import st_like
+
+    assert st_like("*ST海创")
+    assert st_like("ST中侨")
+    assert st_like("退市海创")
+    assert not st_like("浦发银行")
+    assert not st_like("")
+
+
+def test_names_for_st_filter_skips_future_names(tmp_path):
+    from zhixing_quant.data.tdx_loader import names_for_st_filter
+
+    store = BarStore(tmp_path / "st.db")
+    store.upsert_bars("sh000001", _sample_frame([20230601, 20260909]))
+    store.upsert_securities([("600001", "*ST假票", "sh", "MAIN")])
+    names, warn = names_for_st_filter(store, 20230601)
+    assert names == {}
+    assert warn and "跳过 ST 过滤" in warn
+    names_now, warn_now = names_for_st_filter(store, 20260909)
+    assert names_now["600001"] == "*ST假票"
+    assert warn_now is None
+    store.close()

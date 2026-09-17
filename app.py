@@ -20,6 +20,7 @@ st.set_page_config(page_title="知行量化", layout="wide", page_icon="📈",
 
 from zhixing_quant.ui import components as C            # noqa: E402
 from zhixing_quant.ui import param_schema as PS         # noqa: E402
+from zhixing_quant.ui import theme as T                 # noqa: E402
 from zhixing_quant.ui.theme import (                    # noqa: E402
     MA_FAST, SIGNAL_LINE, apply_layout, candlestick_colors, inject_css,
 )
@@ -249,36 +250,42 @@ def page_strategies(cfg, book):
 
 
 def _list_and_chart(cands: pd.DataFrame, charts: dict, key: str):
-    """左列表 + 右K线。下拉框选股切换图形（st.dataframe 的行选择事件在
-    Streamlit 1.40 上点击只聚焦单元格、不触发行选择，不可靠）。"""
+    """左列表 + 右K线。点列表里哪只，右边就画哪只。
+
+    st.dataframe 的行选择事件在 Streamlit 1.40 上点击只聚焦单元格、
+    不触发回调，所以列表用按钮行实现——点哪行画哪行。
+    """
     left, right = st.columns([5, 7], gap="medium")
 
     with left:
-        show = cands.copy()
-        cols = {"code": "代码", "name": "名称", "close": "收盘", "pct_chg": "涨跌%",
-                "amount": "成交额", "stop_loss": "止损", "confidence": "信心"}
-        avail = [c for c in cols if c in show.columns]
-        view = show[avail].rename(columns=cols)
-        if "成交额" in view:
-            view["成交额"] = (show["amount"] / 1e8).round(2)
-        st.dataframe(
-            view, use_container_width=True, hide_index=True, height=480,
-            column_config={
-                "涨跌%": st.column_config.NumberColumn(format="%+.2f"),
-                "成交额": st.column_config.NumberColumn("成交额(亿)", format="%.2f"),
-                "收盘": st.column_config.NumberColumn(format="%.2f"),
-                "止损": st.column_config.NumberColumn(format="%.2f"),
-            })
-        options = [
-            f"{row['code']} {row.get('name', '')}" for _, row in show.iterrows()
-        ]
-        pick = st.selectbox("在图中查看", options, key=f"pick_{key}")
-        idx = options.index(pick) if pick in options else 0
-        st.caption(f"共 {len(cands)} 只，选中后看右边的K线")
+        header = st.columns([2.2, 2.6, 1.4, 1.4, 1.6, 1])
+        for col, text in zip(header, ["代码", "名称", "收盘", "成交额", "止损", "信心"]):
+            col.markdown(f"<span style='color:{T.TEXT_3};font-size:12px'>{text}</span>",
+                         unsafe_allow_html=True)
+        default_code = str(cands.iloc[0]["code"])
+        picked = st.session_state.get(f"picked_{key}", default_code)
+        if not cands["code"].astype(str).eq(picked).any():
+            picked = default_code
 
-    code = str(cands.iloc[idx]["code"])
+        with st.container(height=500):
+            for _, row in cands.iterrows():
+                code = str(row["code"])
+                name = str(row.get("name", ""))[:6]
+                label = (f"{code}  {name}　{row['close']:.2f}"
+                         f"　{(row['amount'] / 1e8):.1f}亿"
+                         f"　{row['stop_loss']:.2f}　{int(row.get('confidence', 0))}")
+                if st.button(label, key=f"row_{key}_{code}",
+                             use_container_width=True,
+                             type="primary" if code == picked else "secondary"):
+                    picked = code
+                    st.session_state[f"picked_{key}"] = code
+                    st.rerun()   # 让选中高亮立即跟着点选走
+        st.caption(f"共 {len(cands)} 只，点任意一行看右边的K线")
+
+    row = cands[cands["code"].astype(str) == picked].iloc[0]
+    code = str(row["code"])
     with right:
-        nm = str(cands.iloc[idx].get("name", ""))
+        nm = str(row.get("name", ""))
         st.markdown(f"**{code}** {nm}")
         if code in charts:
             _draw_kline(charts[code], code, height=520)
@@ -452,6 +459,8 @@ def page_backtest(cfg, book):
     if regime_log is not None and not regime_log.empty:
         st.markdown("**活跃市值区间触发**")
         show = regime_log.copy()
+        show["trade_date"] = pd.to_datetime(
+            show["trade_date"].astype(str), format="%Y%m%d").dt.strftime("%Y-%m-%d")
         show["pct"] = show["pct"].map(lambda v: f"{v:+.2%}")
         show.columns = ["日期", "活跃市值", "当日涨跌", "触发依据", "触发后区间"]
         st.dataframe(show, use_container_width=True, hide_index=True, height=200)
@@ -668,10 +677,13 @@ def _draw_kline(df: pd.DataFrame, title: str = "", height: int = 640):
                                        for o, c in zip(d["open"], d["close"])]),
                   row=2, col=1)
     if sub:
-        # 通达信 STICKLINE：每根砖从前一日值画到当日值，涨红跌绿
-        prev = d["brick_value"].shift(1).fillna(0.0)
+        # 通达信 STICKLINE：每根砖从前一日值画到当日值，涨红跌绿。
+        # 首日没有前值，不画（否则会有一根从 0 冲上来的长假砖）
+        prev = d["brick_value"].shift(1)
+        heights = (d["brick_value"] - prev).abs()
+        valid = prev.notna() & d["brick_value"].notna()
         fig.add_trace(go.Bar(
-            x=x, y=(d["brick_value"] - prev).abs(), base=prev,
+            x=x, y=heights.where(valid), base=prev,
             name="砖型图",
             marker_color=[UP if v >= p else DOWN
                           for v, p in zip(d["brick_value"], prev)]), row=3, col=1)

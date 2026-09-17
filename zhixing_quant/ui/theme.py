@@ -219,6 +219,23 @@ section[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input[aria-c
 section[data-testid="stSidebar"] div[role="radiogroup"] label p {{
   font-size:13.5px; margin:0;
 }}
+/* 候选列表的按钮行：还原成可点击的表格行 */
+[data-testid="stMain"] [data-testid="stVerticalBlockBorderBox"] .stButton > button {{
+  min-height:30px; padding:4px 10px; text-align:left; justify-content:flex-start;
+  font-size:12.5px; font-weight:400; border:none; border-radius:4px;
+  box-shadow:none; background:transparent; color:var(--text);
+  border-bottom:1px solid var(--line-soft);
+}}
+[data-testid="stMain"] [data-testid="stVerticalBlockBorderBox"] .stButton > button:hover {{
+  background:var(--surface-2); color:var(--text); filter:none;
+  border:none; border-bottom:1px solid var(--line-soft);
+}}
+[data-testid="stMain"] [data-testid="stVerticalBlockBorderBox"] .stButton > button[kind="primary"],
+[data-testid="stMain"] [data-testid="stVerticalBlockBorderBox"] .stButton > button[kind="primary"]:hover {{
+  background:var(--signal-dim); color:var(--signal); border-left:2px solid var(--signal);
+  border-bottom:1px solid var(--line-soft); font-weight:600; filter:none;
+}}
+
 /* 账户切换：紧凑，不要抢导航的注意力 */
 section[data-testid="stSidebar"] [data-testid="stSegmentedControl"] button {{
   font-size:12.5px; padding:3px 10px;

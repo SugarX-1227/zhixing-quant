@@ -39,6 +39,7 @@ class BacktestRun:
     warnings: List[str] = field(default_factory=list)
     regime_log: pd.DataFrame = field(default_factory=pd.DataFrame)  # 区间触发日志
     exit_note: str = ""            # 本次实际生效的出场规则，界面要显示出来
+    entry_note: str = ""           # 本次实际生效的建仓规则
 
     @property
     def drawdown(self) -> pd.Series:
@@ -84,7 +85,7 @@ def run_backtest(
     from zhixing_quant.data.tdx_loader import (
         get_store, load_daily_many, survivorship_warnings,
     )
-    from zhixing_quant.indicators.pipeline import run_pipeline
+    from zhixing_quant.indicators.pipeline import PIPELINES, run_steps
 
     sig_col = BACKTESTABLE.get(strategy)
     if sig_col is None:
@@ -92,6 +93,17 @@ def run_backtest(
             f"{strategy} 暂不支持回测。它的信号需要逐根K线求值，"
             f"而回测引擎读的是预先算好的信号列。目前支持：{', '.join(BACKTESTABLE)}"
         )
+
+    # 出场规则可能要用战法流水线不产出的列（破黄线要 dual_line，
+    # 防守阶梯要 sell_s / distribution）。缺列时 DefenseEngine 会一路
+    # row.get(..., False)，规则静默失效且界面看不出来——所以这里
+    # 把依赖并进流水线，而不是指望战法自己带上。
+    from zhixing_quant.backtest.exits import required_steps, spec_from_config
+    exit_spec = spec_from_config(cfg, strategy)
+    steps = list(PIPELINES.get(strategy, [strategy]))
+    for extra in required_steps(exit_spec):
+        if extra not in steps:
+            steps.append(extra)
 
     as_of = universe_as_of or start
     warnings: List[str] = check_universe_as_of(as_of, start)
@@ -117,7 +129,7 @@ def run_backtest(
             short_history += 1
             continue
         try:
-            data[code] = run_pipeline(df, cfg, strategy).df
+            data[code] = run_steps(df, cfg, steps).df
         except Exception as exc:
             errors[code] = f"{type(exc).__name__}: {exc}"
         if progress is not None and i % 25 == 0:
@@ -152,12 +164,16 @@ def run_backtest(
 
     # 出场规则：回测与实盘共用 config 的 exits 段，见 backtest/exits.py。
     # 不再是写死的「信号日低点止损 + 15% 止盈 + 满 20 日清仓」。
-    from zhixing_quant.backtest.exits import policy_from_config, spec_from_config
+    from zhixing_quant.backtest.exits import policy_from_config
     exit_policy = policy_from_config(cfg, strategy)
+    # 建仓规则：底仓比例 + 分批加仓（规划书 6.2.1 B1 五步循环第 1、3 步）
+    from zhixing_quant.portfolio.sizer import entry_spec_from_config
+    entry_spec = entry_spec_from_config(cfg, strategy)
 
     engine = BacktestEngine(cfg)
     result = engine.run(data, signal_col=sig_col, start_date=start, end_date=end,
-                        regime=regime_map, exit_policy=exit_policy)
+                        regime=regime_map, exit_policy=exit_policy,
+                        entry_spec=entry_spec)
 
     warnings.extend(survivorship_warnings(get_store()))
 
@@ -199,7 +215,8 @@ def run_backtest(
         skipped=skipped,
         warnings=warnings,
         regime_log=regime_log.reset_index(drop=True),
-        exit_note=spec_from_config(cfg, strategy).describe(),
+        exit_note=exit_spec.describe(),
+        entry_note=entry_spec.describe(),
     )
 
 

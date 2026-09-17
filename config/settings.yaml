@@ -184,6 +184,29 @@ backtest:
 # 写死规则一致，这样加上 exits 段之后老结果仍可复现；要改行为就往下面的
 # 战法段里写。
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 建仓规则（底仓比例 + 分批加仓）
+#
+# 规划书 6.2.1「B1 五步循环」的第 1、3 步。此前完全没有实现：引擎一只标的
+# 只建一次仓，`code in positions` 直接跳过，同一只票再出 B1 也不会加仓；
+# 建仓规模走的是风险头寸公式，不是「底仓 10-20%」这种固定比例。
+#
+# base_pct = 0 表示回落到 backtest.sizing 的口径（风险头寸 / 等权）。
+# ---------------------------------------------------------------------------
+entries:
+  default:
+    base_pct: 0.0        # 底仓占权益比例，0 = 用 backtest.sizing 的口径
+    addon_pct: 0.0       # 每次同向信号加仓比例，0 = 不加仓
+    max_addons: 0
+    addon_min_gain: -1.0 # 加仓前最低浮盈，-1.0 = 不设门槛
+
+  # 规划书 6.2.1：B1 建底仓 10-20%，区间内每出现一次 sig_b1 加 5%，最多 4 次。
+  # 满仓状态 = 15% + 4×5% = 35%。
+  b1:
+    base_pct: 0.15
+    addon_pct: 0.05
+    max_addons: 4
+
 exits:
   default:
     stop:
@@ -231,19 +254,30 @@ exits:
   #             后收盘跌回成本）/ 低低走人（浮盈曾超 5% 后收盘 < 前一日最低）
   #   多头转空头由择时闸门处理（引擎在空头日开盘强制清仓），不在此配置。
   #   不设初始价位止损、不限最长持有天数。
+  # 2026-09 复核：以下改为规划书 6.2.1「B1 五步循环」的原始口径。
+  #   1) B1 建底仓 10-20%            -> entries.b1.base_pct
+  #   2) 横盘期拿住（不破白线不动）    -> 不设初始止损、不限持有天数
+  #   3) 区间内分批加仓               -> entries.b1.addon_pct / max_addons
+  #   4) 脱离成本 5%+ 放飞底仓的 1/3  -> price_tiers 第一档 gain 0.05
+  #   5) 破白线减半，破黄线全清        -> white_line_break 0.5 + break_yellow_line
+  #
+  # 与改动前（使用者实测调出来的那版）的差异，改回去只需三行：
+  #   - 放飞门槛 8% -> 5%（规划书写的是「脱离成本 5%+」）
+  #   - 破白线从「移动止损全出」改成「减半」，剩余半仓交给破黄线
+  #   - 去掉 +20% 第二档（规划书只有一次放飞；要保留就把那行加回 price_tiers）
+  # 盈转亏 / 低低走人是使用者加的，规划书没写但不冲突，保留。
   b1:
     stop:
       kind: none
     trailing:
-      kind: white_line
-      activate_profit: 0.08
+      kind: none
     take_profit:
       kind: price_tiers
       price_tiers:
-        - {gain: 0.08, sell: 0.33}
-        - {gain: 0.20, sell: 0.33}
+        - {gain: 0.05, sell: 0.33}
     time_stop:
       max_holding_days: 0
+    white_line_break: 0.5
     break_yellow_line: true
     profit_to_loss: 0.02
     close_below_prev_low: 0.05
@@ -264,11 +298,25 @@ exits:
       price_tiers:
         - {gain: 0.08, sell: 0.33}
         - {gain: 0.20, sell: 0.33}
+    # 规划书 4.3.2：sig_b2_hold_max 默认 2，「仅允许休整 1 天」；
+    # 6.3 共享出场第 3 条：2 个交易日内未大幅拉升 → 全清。
+    # 改动前这里是 max_holding_days: 0（完全不限），B2 是爆发型确认阳线，
+    # 不拉升就说明判断错了，拖着只会把小亏拖成大亏。
     time_stop:
       max_holding_days: 0
+      no_progress_days: 2
+      min_progress: 0.03
     break_yellow_line: true
     profit_to_loss: 0.02
     close_below_prev_low: 0.05
+    # 规划书 6.3 共享出场第 1、4 条：S1 减 50%、主力出货减 50%。
+    # 只开阶梯里这两级——破白线/破黄线/止损止盈上面已有显式规则，
+    # 全开会两边打架。runner 会按 required_steps 自动把
+    # sell_s / distribution / volume_price 并进指标流水线。
+    defense_ladder: true
+    defense_rules: [s1, distribution]
+    defense_s1_portion: 0.5
+    defense_distribution_portion: 0.5
 
 strategies:
   brick:

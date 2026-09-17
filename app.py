@@ -402,6 +402,8 @@ def page_backtest(cfg, book):
         st.warning(w)
     st.caption(f"股票池：{run.universe_note}　|　实际回测 {run.loaded} 只"
                + (f"，跳过 {run.skipped} 只（K线不足）" if run.skipped else ""))
+    if getattr(run, "entry_note", ""):
+        st.caption(f"建仓规则：{run.entry_note}")
     if getattr(run, "exit_note", ""):
         st.caption(f"出场规则：{run.exit_note}")
     if changed:

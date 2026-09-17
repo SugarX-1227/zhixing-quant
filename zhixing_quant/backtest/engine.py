@@ -56,6 +56,8 @@ class Position:
     entry_low: float = 0.0     # 建仓那根 K 线的最低价，防守阶梯 P2 要用
     highest_high: float = 0.0  # 持仓期间最高价，移动止损的锚
     tier_done: int = 0         # 分级止盈已经执行到第几档
+    addons: int = 0            # 已经加过几次仓（规划书 6.2.1 第 3 步）
+    white_break_done: bool = False   # 破白线减仓只执行一次，不是每天减
     exit_reason: str = ""      # 收盘型规则挂出的卖出理由
 
     def as_dict(self) -> dict:
@@ -134,6 +136,7 @@ class BacktestEngine:
         end_date: Optional[str] = None,
         regime: Optional[Dict[str, str]] = None,
         exit_policy=None,
+        entry_spec=None,
     ) -> BacktestResult:
         """跑一次回测。
 
@@ -145,6 +148,9 @@ class BacktestEngine:
             take_profit_pct: 止盈比例。
             exit_fn: 可选自定义卖出判断 (df, idx, position) -> Optional[str]，
                      返回卖出原因字符串表示卖出。exit_policy 优先。
+            entry_spec: portfolio/sizer.EntrySpec。给了就按「底仓 + 分批加仓」
+                     建仓（规划书 6.2.1 B1 五步循环的第 1、3 步）；不给则
+                     一只标的只建一次仓，规模由 backtest.sizing 决定。
             exit_policy: backtest/exits.ExitPolicy。给了就用它决定止损价、
                      止盈价、移动止损和收盘型出场，`take_profit_pct` 与内置
                      的「满 N 日清仓」一并让位。不给则保持旧行为
@@ -224,7 +230,11 @@ class BacktestEngine:
 
             for order in list(pending_entries):
                 code = order["code"]
-                if code in positions or len(positions) >= self.max_positions:
+                held = positions.get(code)
+                scaling = held is not None
+                if scaling and not self._can_add(held, entry_spec):
+                    continue
+                if not scaling and len(positions) >= self.max_positions:
                     continue
                 bar = self._bar(prepared, code, date)
                 if bar is None:
@@ -235,23 +245,49 @@ class BacktestEngine:
                 if self._is_limit_up_open(prepared, code, date):
                     continue          # 一字涨停买不进
                 price = self._fill_price(bar["open"], "BUY")
-                # 止损要先定下来，风险头寸公式需要它：股数 = 风险预算 ÷ 每股风险
-                if exit_policy is not None:
-                    stop, take = exit_policy.initial_levels(
-                        prepared[code]["ef"], bar["i"], price)
+
+                if scaling:
+                    gain = price / held.entry_price - 1.0 if held.entry_price else 0.0
+                    if gain < entry_spec.addon_min_gain:
+                        continue
+                    shares = self._pct_shares(entry_spec.addon_pct, last_equity, price)
                 else:
-                    raw = order["stop"] if order["stop"] > 0 else bar["low"] * 0.97
-                    stop, take = min(raw, price * 0.99), price * (1 + take_profit_pct)
-                shares = self._entry_shares(
-                    cash, positions, price, stop,
-                    equity=last_equity, held_value=last_held,
-                    regime=regime_map.get(date_str, "NEUTRAL"))
+                    # 止损要先定下来，风险头寸公式需要它：股数 = 风险预算 ÷ 每股风险
+                    if exit_policy is not None:
+                        stop, take = exit_policy.initial_levels(
+                            prepared[code]["ef"], bar["i"], price)
+                    else:
+                        raw = order["stop"] if order["stop"] > 0 else bar["low"] * 0.97
+                        stop, take = min(raw, price * 0.99), price * (1 + take_profit_pct)
+                    if entry_spec is not None and entry_spec.base_pct > 0:
+                        shares = self._pct_shares(entry_spec.base_pct, last_equity, price)
+                    else:
+                        shares = self._entry_shares(
+                            cash, positions, price, stop,
+                            equity=last_equity, held_value=last_held,
+                            regime=regime_map.get(date_str, "NEUTRAL"))
+
+                if shares <= 0:
+                    continue
+                affordable = int(cash * 0.98 // (price * 100)) * 100
+                shares = min(shares, affordable)
                 if shares <= 0:
                     continue
                 cost, _ = self._buy_cost(price, shares)
                 if cost > cash:
                     continue
                 cash -= cost
+
+                if scaling:
+                    # 加权平均成本：后面的止盈档位、盈转亏判定都按新均价算
+                    total = held.shares + shares
+                    held.entry_price = (held.entry_price * held.shares
+                                        + price * shares) / total
+                    held.shares = total
+                    held.cost_basis += cost
+                    held.addons += 1
+                    continue
+
                 positions[code] = Position(
                     code=code,
                     entry_date=date_str,
@@ -307,6 +343,8 @@ class BacktestEngine:
                         if decision.portion < 1.0:
                             pos.tier_done = max(pos.tier_done,
                                                 decision.tier or _tier_of(decision.reason))
+                        if "跌破白线" in decision.reason:
+                            pos.white_break_done = True
                         if code not in pending_exits:
                             pending_exits.append(code)
                     continue
@@ -327,12 +365,16 @@ class BacktestEngine:
                                     "equity": round(equity, 2), "positions": snapshot})
 
             # 生成明日买单（明日开盘即知为空头区间则不生成）
-            if (day_i < len(calendar) - 1 and len(positions) < self.max_positions
+            can_scale = (entry_spec is not None and entry_spec.scales_in
+                         and any(self._can_add(p, entry_spec) for p in positions.values()))
+            if (day_i < len(calendar) - 1
+                    and (len(positions) < self.max_positions or can_scale)
                     and regime_map.get(
                         calendar[day_i + 1].strftime("%Y-%m-%d"), "NEUTRAL") != "BEAR"):
                 signals = self._signals_on(prepared, date, signal_col)
                 for code, info in signals[: self.max_entries_per_day]:
-                    if code not in positions:
+                    held = positions.get(code)
+                    if held is None or self._can_add(held, entry_spec):
                         pending_entries.append(info)
 
         equity_curve = pd.Series(equity_values, index=pd.DatetimeIndex(calendar), name="equity")
@@ -545,6 +587,19 @@ class BacktestEngine:
         """等权分配剩余仓位，不超过现金。"""
         slots_left = max(1, self.max_positions - len(positions))
         return min(cash * 0.98, cash / slots_left)
+
+    @staticmethod
+    def _can_add(pos: Position, entry_spec) -> bool:
+        """这只持仓还能不能再加一次仓。"""
+        return (entry_spec is not None and entry_spec.scales_in
+                and pos.addons < entry_spec.max_addons)
+
+    @staticmethod
+    def _pct_shares(pct: float, equity: float, price: float) -> int:
+        """按权益的固定比例算股数，100 股整手。"""
+        if pct <= 0 or equity <= 0 or price <= 0:
+            return 0
+        return int(equity * pct // (price * 100)) * 100
 
     def _entry_shares(self, cash: float, positions: dict, price: float,
                       stop: float, equity: float, held_value: float,

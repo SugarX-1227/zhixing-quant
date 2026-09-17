@@ -130,12 +130,23 @@ class ExitSpec:
     take_profit: TakeProfitSpec = field(default_factory=TakeProfitSpec)
     time_stop: TimeStopSpec = field(default_factory=TimeStopSpec)
     defense_ladder: bool = False    # 启用 portfolio/defense.py 八级阶梯
+    # 只启用阶梯里的哪几级（按 reason 前缀，如 ("s1", "distribution")）。
+    # 空 = 全部。规划书 6.3 只要 S1 和主力出货这两条，其余（破白线/破黄线/
+    # 止损止盈）在本模块里已有显式规则，全开会两边打架。
+    defense_rules: Tuple[str, ...] = ()
     strategy_exit: bool = False     # 调用战法自身 exit_conditions
     break_yellow_line: bool = False  # 收盘跌破黄线即清仓（规格 01.3 [LOCKED]）
     # 盈转亏：浮盈曾超过此比例后，某天收盘跌回成本下方 → 当日清仓。0 = 关闭
     profit_to_loss: float = 0.0
     # 低低走人：浮盈曾超过此比例后，某天收盘 < 前一日最低价 → 当日清仓。0 = 关闭
     close_below_prev_low: float = 0.0
+    # 收盘跌破白线的减仓比例。规划书 6.2.1 第 5 步是「破白线减半，破黄线全清」，
+    # 所以这里默认语义是**减半**而不是清仓。0 = 关闭，1.0 = 全清。
+    white_line_break: float = 0.0
+    # 防守阶梯里这两条按规划书 6.3 是**减 50%** 而不是清仓。
+    # 0 = 沿用阶梯默认的全清。
+    defense_s1_portion: float = 0.0
+    defense_distribution_portion: float = 0.0
 
     def describe(self) -> str:
         parts = [f"止损={self.stop.kind}"]
@@ -153,8 +164,12 @@ class ExitSpec:
             parts.append(f"盈转亏清仓(浮盈>{self.profit_to_loss:.0%}后)")
         if self.close_below_prev_low:
             parts.append(f"低低走人(浮盈>{self.close_below_prev_low:.0%}后)")
+        if self.white_line_break:
+            parts.append("破白线全清" if self.white_line_break >= 1.0
+                         else f"破白线减{self.white_line_break:.0%}")
         if self.defense_ladder:
-            parts.append("防守阶梯")
+            parts.append("防守阶梯" + (f"[{'/'.join(self.defense_rules)}]"
+                                     if self.defense_rules else ""))
         if self.strategy_exit:
             parts.append("战法出场")
         return " · ".join(parts)
@@ -309,9 +324,29 @@ class ExitPolicy:
         # P3-P8 防守阶梯
         if self.spec.defense_ladder and self.defense is not None:
             sig = self.defense.evaluate_row(frame.row(i), pos.as_dict())
-            if sig is not None:
+            if sig is not None and self._ladder_enabled(sig.reason):
+                # 规划书 6.3 的 B2 共享出场逻辑里，S1 和主力出货是**减 50%**，
+                # 只有跌破入场低点和「2 日不拉升」才全清。阶梯本身只会返回
+                # 一个「卖出」信号，减仓比例在这里补。
+                portion = 1.0
+                if sig.reason.startswith("s1") and self.spec.defense_s1_portion > 0:
+                    portion = float(self.spec.defense_s1_portion)
+                elif (sig.reason.startswith("distribution")
+                        and self.spec.defense_distribution_portion > 0):
+                    portion = float(self.spec.defense_distribution_portion)
                 hits.append(ExitDecision(reason=f"防守{sig.priority}:{sig.reason}",
-                                         portion=1.0, priority=sig.priority))
+                                         portion=portion, priority=sig.priority))
+
+        # 跌破白线减仓（规划书 6.2.1 第 5 步：破白线减半，破黄线全清）。
+        # 白线比黄线快，所以这是第一道结构性减仓，不是清仓。
+        # 每个持仓只减一次，靠 white_break_done 记住，否则会连着几天一直减。
+        if self.spec.white_line_break > 0 and not pos.white_break_done:
+            w = frame.white_line[i]
+            if np.isfinite(w) and frame.close[i] < w:
+                portion = float(self.spec.white_line_break)
+                hits.append(ExitDecision(
+                    reason="跌破白线清仓" if portion >= 1.0 else f"跌破白线减{portion:.0%}",
+                    portion=portion, priority=6))
 
         # 跌破黄线（规格 01.3 [LOCKED]：清仓并移出股票池）
         if self.spec.break_yellow_line:
@@ -354,6 +389,11 @@ class ExitPolicy:
             return None
         hits.sort(key=lambda d: d.priority)
         return hits[0]
+
+    def _ladder_enabled(self, reason: str) -> bool:
+        """defense_rules 为空时全开，否则只放行前缀匹配的那几级。"""
+        rules = self.spec.defense_rules
+        return not rules or any(str(reason).startswith(r) for r in rules)
 
     def _strategy_exit(self, frame: "ExitFrame", i: int, pos) -> Optional[ExitDecision]:
         """调战法的 exit_conditions。它收 DataFrame，所以这里才做一次切片。"""
@@ -489,7 +529,12 @@ def spec_from_config(cfg: dict, strategy: Optional[str] = None) -> ExitSpec:
             no_progress_days=int(ts.get("no_progress_days", 0)),
             min_progress=float(ts.get("min_progress", 0.0)),
         ),
+        white_line_break=float(merged.get("white_line_break", 0.0) or 0.0),
+        defense_s1_portion=float(merged.get("defense_s1_portion", 0.0) or 0.0),
+        defense_distribution_portion=float(
+            merged.get("defense_distribution_portion", 0.0) or 0.0),
         defense_ladder=bool(merged.get("defense_ladder", False)),
+        defense_rules=tuple(merged.get("defense_rules", ()) or ()),
         strategy_exit=bool(merged.get("strategy_exit", False)),
         break_yellow_line=bool(merged.get("break_yellow_line", False)),
         profit_to_loss=float(merged.get("profit_to_loss", 0.0) or 0.0),
@@ -520,3 +565,60 @@ def _deep_merge(base: dict, override: dict) -> dict:
         else:
             out[k] = v
     return out
+
+
+# ---------------------------------------------------------------------------
+# 出场规则对指标的依赖
+# ---------------------------------------------------------------------------
+
+# 防守阶梯每一级要读的列由哪个流水线步骤产出。
+# 不把它们加进流水线，`defense_ladder: true` 就是个哑开关——
+# 列不存在，DefenseEngine 的 row.get(..., False) 一路返回 False，
+# 界面上看不出任何异常，规则却一次都没跑过。这正是本仓库反复栽过的坑。
+_LADDER_STEPS = {
+    "s1": ["dual_line", "sell_s"],
+    "s2": ["dual_line", "macd", "sell_s"],
+    "s3": ["dual_line", "sell_s"],
+    "distribution": ["volume_price", "distribution"],
+    "macd": ["macd"],
+    "below_white": ["dual_line"],
+    "below_yellow": ["dual_line"],
+    "volume_stagnation": ["volume_price", "distribution"],
+    "take_profit": [],
+    "stop_loss": [],
+}
+
+
+def required_steps(spec: ExitSpec) -> List[str]:
+    """这套出场规则额外需要哪些指标流水线步骤（已去重、保持顺序）。
+
+    调用方把它并进战法自己的流水线，`defense_ladder` 才真的能触发。
+
+    Args:
+        spec: 出场规则。
+
+    Returns:
+        步骤名列表，如 ["dual_line", "sell_s"]。
+    """
+    steps: List[str] = []
+
+    def add(names):
+        for n in names:
+            if n not in steps:
+                steps.append(n)
+
+    # 双线相关的规则都要 dual_line 提供 white_line / yellow_line
+    if (spec.break_yellow_line or spec.white_line_break > 0
+            or spec.trail.kind in ("yellow_line", "white_line")):
+        add(["dual_line"])
+
+    if spec.take_profit.kind == "tiered":
+        add(["brick"])              # red_streak 由砖型图产出
+
+    if spec.defense_ladder:
+        wanted = spec.defense_rules or tuple(_LADDER_STEPS)
+        for rule in wanted:
+            for key, needs in _LADDER_STEPS.items():
+                if key.startswith(rule) or rule.startswith(key):
+                    add(needs)
+    return steps

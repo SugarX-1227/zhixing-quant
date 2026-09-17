@@ -111,3 +111,70 @@ def regime_cap(cfg: dict, regime: str) -> float:
         "NEUTRAL": float(pcfg.get("neutral_max_total", 0.50)),
         "BEAR": float(pcfg.get("bear_max_total", 0.0)),
     }.get(str(regime).upper(), float(pcfg.get("neutral_max_total", 0.50)))
+
+
+# ---------------------------------------------------------------------------
+# 建仓计划：底仓 + 分批加仓
+# ---------------------------------------------------------------------------
+#
+# 规划书 6.2.1「B1 五步循环」：
+#     1) B1 建底仓（10-20%）
+#     2) 横盘期拿住（不破白线不动）
+#     3) 区间内分批加仓（每出现一次 sig_b1 加 5%，最多 4 次）
+#     4) 脱离成本 5%+ 放飞底仓的 1/3
+#     5) 破白线减半，破黄线全清
+#
+# 第 1、3 步此前完全没有实现：引擎一只标的只建一次仓，`code in positions`
+# 就直接跳过，同一只票再出信号也不会加仓；建仓规模走的是风险头寸公式，
+# 不是「底仓 10-20%」这种固定比例。第 4、5 步见 backtest/exits.py。
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class EntrySpec:
+    """一套建仓规则。
+
+    Attributes:
+        base_pct: 底仓占权益比例。0 = 不用固定比例，回落到
+            `backtest.sizing` 指定的口径（风险头寸 / 等权）。
+        addon_pct: 每次同向信号的加仓比例（占权益）。0 = 不加仓。
+        max_addons: 最多加几次。
+        addon_min_gain: 加仓前要求的最低浮盈，可以为负（允许逆势补仓）。
+            规划书说的是「区间内分批加仓」，即还在结构里就能加，
+            所以缺省 -1.0 表示不设门槛，由出场规则负责把破位的仓位清掉。
+    """
+    base_pct: float = 0.0
+    addon_pct: float = 0.0
+    max_addons: int = 0
+    addon_min_gain: float = -1.0
+
+    @property
+    def scales_in(self) -> bool:
+        return self.addon_pct > 0 and self.max_addons > 0
+
+    def describe(self) -> str:
+        if self.base_pct <= 0 and not self.scales_in:
+            return "按风险头寸一次建满"
+        parts = []
+        if self.base_pct > 0:
+            parts.append(f"底仓{self.base_pct:.0%}")
+        if self.scales_in:
+            parts.append(f"每次信号加{self.addon_pct:.0%}×最多{self.max_addons}次")
+        return " + ".join(parts)
+
+
+def entry_spec_from_config(cfg: dict, strategy: str = None) -> EntrySpec:
+    """读 cfg["entries"]，`entries.<战法>` 逐项覆盖 `entries.default`。
+
+    缺省全 0，即保持「按风险头寸一次建满」的旧行为。
+    """
+    root = (cfg or {}).get("entries", {}) or {}
+    merged = dict(root.get("default", {}) or {})
+    merged.update((root.get(strategy, {}) or {}) if strategy else {})
+    return EntrySpec(
+        base_pct=float(merged.get("base_pct", 0.0) or 0.0),
+        addon_pct=float(merged.get("addon_pct", 0.0) or 0.0),
+        max_addons=int(merged.get("max_addons", 0) or 0),
+        addon_min_gain=float(merged.get("addon_min_gain", -1.0)),
+    )

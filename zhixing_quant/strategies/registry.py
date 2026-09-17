@@ -16,9 +16,7 @@ from zhixing_quant.strategies.b1_strategy import B1Strategy
 from zhixing_quant.strategies.b2_strategy import B2Strategy
 from zhixing_quant.strategies.base import Strategy
 from zhixing_quant.strategies.brick_strategy import BrickStrategy
-from zhixing_quant.strategies.dual_line import DualLineStrategy
 from zhixing_quant.strategies.single_needle_strategy import SingleNeedleStrategy
-from zhixing_quant.strategies.yoga_pants import YogaPantsStrategy
 
 STRATEGY_REGISTRY: dict = {}
 
@@ -48,6 +46,4 @@ def list_strategies(filter_regime: str = None) -> list:
 register_strategy("brick", BrickStrategy)
 register_strategy("b1", B1Strategy)
 register_strategy("b2", B2Strategy)
-register_strategy("dual_line", DualLineStrategy)
-register_strategy("yoga_pants", YogaPantsStrategy)
 register_strategy("single_needle", SingleNeedleStrategy)

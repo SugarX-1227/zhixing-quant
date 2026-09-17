@@ -29,8 +29,6 @@ STRATEGY_META: Dict[str, dict] = {
     "brick":         {"label": "砖型图",   "book": "scalp", "spec": "S4"},
     "b1":            {"label": "B1 阶段低点", "book": "swing", "spec": "04.2"},
     "b2":            {"label": "B2 确认阳线", "book": "swing", "spec": "04.3"},
-    "dual_line":     {"label": "双线战法", "book": "swing", "spec": "S1"},
-    "yoga_pants":    {"label": "瑜伽裤",   "book": "scalp", "spec": "S6"},
     "single_needle": {"label": "单针下30", "book": "scalp", "spec": "S5"},
 }
 
@@ -74,9 +72,6 @@ REASON_TEXT = {
     "brick_entry": "昨天绿柱 + 今天红柱 + 红柱高度达标 + 收盘站上知行多空线",
     "b1_stage_low": "J值超卖 + 站上知行多空线 + 短期趋势线确认 + 涨跌幅在 ±4% 内",
     "b2_confirm": "B1 之后的确认阳线 + 放量",
-    "dual_line_golden_cross": "白线上穿黄线 + 放量 + 收盘站上黄线",
-    "yoga_pants_b1_or_sb1": "B1 阶段性低点或 SB1 洗盘买点触发",
-    "yoga_pants_b3_confirm": "B3 中继买点，用于加仓而非开仓",
     "single_needle_30": "单针下探超过 30%，长下影收回",
 }
 

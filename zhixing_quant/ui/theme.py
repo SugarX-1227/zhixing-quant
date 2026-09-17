@@ -129,7 +129,6 @@ html, body, .stApp, [class*="css"] {{
 
 section[data-testid="stSidebar"] {{
   background:var(--surface); border-right:1px solid var(--line-soft);
-  width:210px !important;
 }}
 section[data-testid="stSidebar"] .block-container {{ padding:20px 14px; }}
 
@@ -185,24 +184,39 @@ hr {{ border-color:var(--line-soft); margin:22px 0; }}
    原型里导航是自定义 HTML，Streamlit 的 radio 带圆圈、间距大，长得完全不一样。
    改用 button 做导航，这里把它还原成原型的样子：
    未选中 = 透明底 + 次要文字色；选中 = 淡黄底 + 黄字 + 左侧黄条。      */
-section[data-testid="stSidebar"] .stButton > button {{
-  height:auto; min-height:34px; padding:7px 11px;
-  background:transparent; border:none; border-left:2px solid transparent;
-  border-radius:var(--r); color:var(--text-2);
-  font-size:13.5px; font-weight:400; text-align:left;
-  justify-content:flex-start; box-shadow:none;
+section[data-testid="stSidebar"] div[role="radiogroup"] {{
+  gap:2px;
 }}
-section[data-testid="stSidebar"] .stButton > button:hover {{
-  background:var(--surface-2); color:var(--text); border-left-color:transparent;
+section[data-testid="stSidebar"] div[role="radiogroup"] > label,
+section[data-testid="stSidebar"] div[role="radiogroup"] > label * {{
+  /* baseweb 在无 theme 配置时会给 radio 塞深色底，全部压掉 */
+  background:transparent !important; box-shadow:none !important;
+  color:var(--text-2) !important;
 }}
-section[data-testid="stSidebar"] .stButton > button[kind="primary"] {{
-  background:var(--signal-dim); color:var(--signal);
-  border-left:2px solid var(--signal); font-weight:600;
+section[data-testid="stSidebar"] div[role="radiogroup"] > label {{
+  display:flex; align-items:center; width:100%; margin:0;
+  min-height:34px; padding:7px 11px;
+  border:none; border-left:2px solid transparent;
+  border-radius:var(--r);
+  font-size:13.5px; cursor:pointer;
 }}
-section[data-testid="stSidebar"] .stButton > button[kind="primary"]:hover {{
-  background:var(--signal-dim); filter:none;
+section[data-testid="stSidebar"] div[role="radiogroup"] > label > div:first-child {{
+  display:none;   /* 藏掉 radio 自带的圆圈 */
 }}
-section[data-testid="stSidebar"] .stButton > button p {{
+section[data-testid="stSidebar"] div[role="radiogroup"] > label:hover {{
+  background:var(--surface-2); color:var(--text);
+}}
+section[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input[aria-checked="true"]),
+section[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input[aria-checked="true"]) * {{
+  background:var(--signal-dim) !important; color:var(--signal) !important;
+}}
+section[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input[aria-checked="true"]) {{
+  border-left:2px solid var(--signal);
+}}
+section[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input[aria-checked="true"]) p {{
+  font-weight:600;
+}}
+section[data-testid="stSidebar"] div[role="radiogroup"] label p {{
   font-size:13.5px; margin:0;
 }}
 /* 账户切换：紧凑，不要抢导航的注意力 */

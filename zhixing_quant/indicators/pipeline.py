@@ -154,8 +154,6 @@ PIPELINES: Dict[str, List[str]] = {
     "brick":         ["brick"],
     "b1":            ["b1"],
     "b2":            ["b2"],
-    "dual_line":     ["brick", "dual_line", "volume_price"],
-    "yoga_pants":    ["brick", "b1", "sb1", "b3"],
     "single_needle": ["brick", "single_needle"],
 
     # 防守阶段：DefenseEngine 八级阶梯要读的全部列

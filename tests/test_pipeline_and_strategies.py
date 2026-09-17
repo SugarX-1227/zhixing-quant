@@ -92,11 +92,11 @@ def test_defense_required_columns_declared():
 # 战法适配器
 # ---------------------------------------------------------------------------
 
-def test_six_strategies_registered():
+def test_four_strategies_registered():
     from zhixing_quant.scanner.strategy_scan import available
 
     got = available()
-    assert set(got) == {"brick", "b1", "b2", "dual_line", "yoga_pants", "single_needle"}
+    assert set(got) == {"brick", "b1", "b2", "single_needle"}
 
 
 def test_every_registered_strategy_has_a_pipeline():

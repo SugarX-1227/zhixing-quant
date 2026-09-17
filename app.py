@@ -175,7 +175,7 @@ def page_today(cfg, book):
 # ---------------------------------------------------------------------------
 
 def page_strategies(cfg, book):
-    C.page_head("战法", "六套战法独立扫描")
+    C.page_head("战法", "四套战法独立扫描")
     strategies = _strategies()
 
     c1, c2, c3, c4 = st.columns([2.2, 1.2, 1.2, 1])
@@ -249,7 +249,8 @@ def page_strategies(cfg, book):
 
 
 def _list_and_chart(cands: pd.DataFrame, charts: dict, key: str):
-    """左列表 + 右K线。点左边任意一行，右边立刻画出来。"""
+    """左列表 + 右K线。下拉框选股切换图形（st.dataframe 的行选择事件在
+    Streamlit 1.40 上点击只聚焦单元格、不触发行选择，不可靠）。"""
     left, right = st.columns([5, 7], gap="medium")
 
     with left:
@@ -260,18 +261,20 @@ def _list_and_chart(cands: pd.DataFrame, charts: dict, key: str):
         view = show[avail].rename(columns=cols)
         if "成交额" in view:
             view["成交额"] = (show["amount"] / 1e8).round(2)
-        sel = st.dataframe(
-            view, use_container_width=True, hide_index=True, height=520,
-            on_select="rerun", selection_mode="single-row", key=f"tbl_{key}",
+        st.dataframe(
+            view, use_container_width=True, hide_index=True, height=480,
             column_config={
                 "涨跌%": st.column_config.NumberColumn(format="%+.2f"),
                 "成交额": st.column_config.NumberColumn("成交额(亿)", format="%.2f"),
                 "收盘": st.column_config.NumberColumn(format="%.2f"),
                 "止损": st.column_config.NumberColumn(format="%.2f"),
             })
-        rows = sel.selection.rows if sel and sel.selection else []
-        idx = rows[0] if rows else 0
-        st.caption(f"共 {len(cands)} 只，点任意一行看右边的K线")
+        options = [
+            f"{row['code']} {row.get('name', '')}" for _, row in show.iterrows()
+        ]
+        pick = st.selectbox("在图中查看", options, key=f"pick_{key}")
+        idx = options.index(pick) if pick in options else 0
+        st.caption(f"共 {len(cands)} 只，选中后看右边的K线")
 
     code = str(cands.iloc[idx]["code"])
     with right:
@@ -665,9 +668,13 @@ def _draw_kline(df: pd.DataFrame, title: str = "", height: int = 640):
                                        for o, c in zip(d["open"], d["close"])]),
                   row=2, col=1)
     if sub:
-        fig.add_trace(go.Bar(x=x, y=d["brick_value"], name="砖型图",
-                             marker_color=[UP if v >= 0 else DOWN
-                                           for v in d["brick_value"]]), row=3, col=1)
+        # 通达信 STICKLINE：每根砖从前一日值画到当日值，涨红跌绿
+        prev = d["brick_value"].shift(1).fillna(0.0)
+        fig.add_trace(go.Bar(
+            x=x, y=(d["brick_value"] - prev).abs(), base=prev,
+            name="砖型图",
+            marker_color=[UP if v >= p else DOWN
+                          for v, p in zip(d["brick_value"], prev)]), row=3, col=1)
     apply_layout(fig, height=height, title="")
     st.plotly_chart(fig, use_container_width=True)
 
@@ -678,8 +685,6 @@ PAGES = {"今日": page_today, "持仓": page_positions, "战法": page_strategi
 
 def main():
     cfg = get_config()
-    if "page" not in st.session_state:
-        st.session_state["page"] = "今日"
 
     st.sidebar.markdown(
         "<div style='padding:2px 4px 12px;font-size:16px;font-weight:600'>知行</div>",
@@ -689,12 +694,8 @@ def main():
         label_visibility="collapsed") or "swing"
     st.sidebar.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
-    for name in PAGE_ORDER:
-        active = st.session_state["page"] == name
-        if st.sidebar.button(name, key=f"nav_{name}", use_container_width=True,
-                             type="primary" if active else "secondary"):
-            st.session_state["page"] = name
-            st.rerun()
+    page = st.sidebar.radio("页面", PAGE_ORDER, key="nav_page",
+                            label_visibility="collapsed")
 
     h = _health()
     if h.get("ok"):
@@ -719,7 +720,7 @@ def main():
     else:
         st.sidebar.error("数据未就绪")
 
-    PAGES[st.session_state["page"]](cfg, book)
+    PAGES[page](cfg, book)
 
 
 if __name__ == "__main__":

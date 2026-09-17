@@ -13,8 +13,9 @@ from zhixing_quant.strategies.registry import (
 def test_registry_has_builtin_strategies():
     assert "brick" in STRATEGY_REGISTRY
     assert "b2" in STRATEGY_REGISTRY
-    assert "dual_line" in STRATEGY_REGISTRY
-    assert "yoga_pants" in STRATEGY_REGISTRY
+    assert "single_needle" in STRATEGY_REGISTRY
+    assert "dual_line" not in STRATEGY_REGISTRY   # 2026-09 使用者确认：双线就是 B1
+    assert "yoga_pants" not in STRATEGY_REGISTRY  # 瑜伽裤是砖型图的另一叫法
 
 
 def test_get_strategy_returns_instance():

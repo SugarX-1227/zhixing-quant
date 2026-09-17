@@ -67,19 +67,6 @@ STRATEGY_PARAMS: Dict[str, List[Param]] = {
               "确认阳线的最小涨幅"),
         Param("b2.j_threshold", "当日 J值上限", "float", 55.0, 20.0, 100.0, 5.0),
     ],
-    "dual_line": [
-        # 白线 EMA(EMA(C,10),10) 的周期。黄线的 [14,28,57,114] 是附录 B.1 的
-        # 原始定义，不作为可调项暴露——改它等于换掉整套体系的骨架，
-        # 而界面上一个滑块看不出这个分量。
-        Param("dual_line.white_span", "白线 EMA 周期", "int", 10, 3, 30, 1,
-              "白线 = EMA(EMA(C,N),N)，二次平滑。规格给 10", tag="LOCKED"),
-        Param("volume_price.vol_ma_window", "量均线周期", "int", 5, 3, 20, 1),
-    ],
-    "yoga_pants": [
-        Param("b1.j_threshold", "B1 J值上限", "float", 13.0, 0.0, 40.0, 1.0),
-        Param("strategies.yoga_pants.allow_b3_addon", "允许 B3 加仓", "bool", True,
-              help="B3 是中继买点，用于加仓而非开仓", tag="LOCKED"),
-    ],
     "single_needle": [
         Param("single_needle.n1", "短周期", "int", 10, 3, 30, 1),
         Param("single_needle.n2", "长周期", "int", 20, 5, 60, 1),

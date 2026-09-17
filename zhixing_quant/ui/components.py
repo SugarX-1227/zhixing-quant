@@ -125,9 +125,10 @@ def regime_card(r) -> None:
     label = REGIME_TEXT.get(r.regime, r.regime)
     color = {"BULL": T.UP, "BEAR": T.DOWN}.get(r.regime, T.TEXT_2)
     room = max(0.0, r.max_total_pct - r.position_pct)
+    trigger = getattr(r, "regime_trigger", "")
     items = [
-        ("活跃市值代理", f"{r.regime_score:.3f}", T.TEXT),
-        ("区间强度", f"{r.regime_strength:.2f}", T.TEXT),
+        ("活跃市值当日涨跌", f"{r.regime_score:+.2%}", T.TEXT),
+        ("触发依据", trigger or "无新触发", T.TEXT_3),
         ("当前仓位", f"{r.position_pct:.1%}", T.TEXT),
         ("可加仓空间", f"{room:.1%}", T.UP if room > 0 else T.TEXT_3),
     ]

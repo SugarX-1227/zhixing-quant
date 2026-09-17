@@ -422,6 +422,17 @@ def page_backtest(cfg, book):
         counts = run.trades["exit_reason"].value_counts()
         right.dataframe(counts.rename("笔数"), use_container_width=True)
 
+    # 活跃市值区间触发日志（空头=-2.3%，多头=单日+4%或三日连涨和>4%）
+    regime_log = getattr(run, "regime_log", None)
+    if regime_log is not None and not regime_log.empty:
+        st.markdown("**活跃市值区间触发**")
+        show = regime_log.copy()
+        show["pct"] = show["pct"].map(lambda v: f"{v:+.2%}")
+        show.columns = ["日期", "活跃市值", "当日涨跌", "触发依据", "触发后区间"]
+        st.dataframe(show, use_container_width=True, hide_index=True, height=200)
+        st.caption("区间为持续态：触发空头后保持空头直到出现多头触发，反之亦然。"
+                   "空头期间禁止开仓，持仓在触发次日开盘清仓。")
+
 
 # ---------------------------------------------------------------------------
 # 持仓 / 个股 / 数据

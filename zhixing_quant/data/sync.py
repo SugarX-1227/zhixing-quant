@@ -235,6 +235,10 @@ def main() -> int:
     parser.add_argument("--full", action="store_true", help="忽略增量偏移，全量重建")
     parser.add_argument("--names", action="store_true", help="同时更新股票名称")
     parser.add_argument("--xdxr", action="store_true", help="同时更新除权除息数据")
+    parser.add_argument(
+        "--oamv", action="store_true",
+        help="同时导入指南针活跃市值(0AMV)日线（需先退出指南针软件）",
+    )
     parser.add_argument("--codes", nargs="*", help="只同步指定代码")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
@@ -273,6 +277,17 @@ def main() -> int:
         if verbose:
             print("\n=== 更新除权除息 ===")
         update_xdxr(cfg, verbose=verbose)
+
+    if args.oamv:
+        from zhixing_quant.data.oamv import sync_oamv
+
+        if verbose:
+            print("\n=== 导入指南针活跃市值(0AMV) ===")
+        try:
+            sync_oamv(cfg, verbose=verbose)
+        except (FileNotFoundError, RuntimeError) as exc:
+            print(f"\n{exc}", file=sys.stderr)
+            return 1
 
     return 0
 

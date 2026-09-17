@@ -65,6 +65,16 @@ CREATE TABLE IF NOT EXISTS xdxr (
     PRIMARY KEY (code, ex_date)
 );
 
+CREATE TABLE IF NOT EXISTS oamv_daily (
+    trade_date INTEGER PRIMARY KEY,
+    open       REAL NOT NULL,
+    high       REAL NOT NULL,
+    low        REAL NOT NULL,
+    close      REAL NOT NULL,
+    vol        REAL NOT NULL,    -- 指南针口径：两市总成交量（股）
+    amount     REAL NOT NULL     -- 指南针口径：两市股票总成交额（元）
+);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -563,6 +573,41 @@ class BarStore:
         if row is None or row["d"] is None:
             return None
         return int(row["d"])
+
+    def upsert_oamv(self, rows: Sequence[tuple]) -> int:
+        """活跃市值日线：(trade_date, open, high, low, close, vol, amount)。"""
+        if not rows:
+            return 0
+        with self.transaction() as conn:
+            conn.executemany(
+                """
+                INSERT INTO oamv_daily
+                    (trade_date, open, high, low, close, vol, amount)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(trade_date) DO UPDATE SET
+                    open=excluded.open, high=excluded.high,
+                    low=excluded.low, close=excluded.close,
+                    vol=excluded.vol, amount=excluded.amount
+                """,
+                [tuple(r) for r in rows],
+            )
+        return len(rows)
+
+    def load_oamv(
+        self, start_date: Optional[int] = None, end_date: Optional[int] = None,
+    ) -> pd.DataFrame:
+        sql = "SELECT * FROM oamv_daily"
+        conds, params = [], []
+        if start_date is not None:
+            conds.append("trade_date >= ?")
+            params.append(int(start_date))
+        if end_date is not None:
+            conds.append("trade_date <= ?")
+            params.append(int(end_date))
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
+        sql += " ORDER BY trade_date"
+        return pd.read_sql_query(sql, self.conn, params=params)
 
 
 def _empty_bar_frame() -> pd.DataFrame:

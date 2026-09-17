@@ -10,6 +10,9 @@ data:
   # 通达信安装目录，脚本会自动找它下面的 vipdoc
   # Windows 例: C:/new_tdx        Mac(Wine/CrossOver) 例: /Users/you/tdx
   tdx_install_dir: E:/Programs/tdx
+  # 指南针数据目录（活跃市值 0AMV 来源），留空则自动扫常见盘符
+  # 同步时需先退出指南针：python -m zhixing_quant.data.sync --oamv
+  compass_dir: E:/Compass/WavMain/ANALYSE/Data/ChinaStk
   db_path: data/market.db
   markets: [sh, sz]
   include_bj: false          # 北交所，需要的话改 true 并把 bj 加进 markets
@@ -112,20 +115,10 @@ distribution:
 # 择时（原文件重复两次，此处为合并后生效的一份）
 # ---------------------------------------------------------------------------
 timing:
-  proxy_weights:
-    northbound: 0.25
-    turnover_change: 0.20
-    main_force: 0.20
-    margin: 0.10
-    advance_decline: 0.10
-    chi_next_sh: 0.10
-    new_high_ratio: 0.05
-  bull_threshold: 0.65
-  bear_threshold: 0.35
-  bull_days: 3
-  bear_days: 3
-  neutral_bull_days: 3
-  neutral_bear_days: 2
+  active_value:
+    bear_drop: -0.023     # 单日跌幅超过此值 → 空头区间：禁开仓+次日开盘清仓
+    bull_surge: 0.04      # 单日涨幅超过此值 → 强势多头
+    bull_3day_sum: 0.04   # 连续3天全涨且单日涨幅简单相加超过此值 → 多头区间
 
 # ---------------------------------------------------------------------------
 # 仓位（原文件重复两次，此处为合并后生效的一份）

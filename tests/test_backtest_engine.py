@@ -144,3 +144,41 @@ def test_missing_signal_column_is_skipped():
     df = df.drop(columns=["sig"])
     res = BacktestEngine(CFG).run({"600000": df}, signal_col="sig")
     assert res.metrics["total_trades"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 活跃市值区间闸门：空头日禁止开仓，持仓当日开盘强制清仓
+# ---------------------------------------------------------------------------
+
+def _regime_map(df, bear_from_idx):
+    return {ts.strftime("%Y-%m-%d"): ("BEAR" if i >= bear_from_idx else "NEUTRAL")
+            for i, ts in enumerate(df.index)}
+
+
+def test_bear_regime_liquidates_positions_at_open():
+    # idx2 收盘出信号 → idx3 开盘买入 → idx4 起为空头，idx4 开盘强制清仓
+    df = _frame([(10, 10.5, 9.5, 10)] * 8, sig_idx=[2])
+    res = BacktestEngine(CFG).run({"600000": df}, signal_col="sig",
+                                  regime=_regime_map(df, 4))
+    frame = res.trades_frame()
+    assert len(frame) == 1
+    t = frame.iloc[0]
+    assert t["exit_reason"] == "空头区间清仓"
+    assert t["entry_date"] < t["exit_date"]
+    assert res.metrics["bear_regime_days"] == 4          # idx4..idx7
+    assert res.metrics["bear_forced_exits"] == 1
+
+
+def test_bear_regime_blocks_pending_entry():
+    # idx2 收盘出信号，但 idx3 开盘已是空头 → 买单作废，整场空仓
+    df = _frame([(10, 10.5, 9.5, 10)] * 8, sig_idx=[2])
+    res = BacktestEngine(CFG).run({"600000": df}, signal_col="sig",
+                                  regime=_regime_map(df, 3))
+    assert res.metrics["total_trades"] == 0
+    assert res.equity_curve.nunique() == 1               # 资金曲线纹丝不动
+
+
+def test_no_regime_map_behaves_as_before():
+    df = _frame([(10, 10.5, 9.5, 10)] * 12, sig_idx=[2])   # 留足持有满5日后的平仓日
+    res = BacktestEngine(CFG).run({"600000": df}, signal_col="sig")
+    assert len(res.trades) == 1                          # 不传 regime 时行为不变

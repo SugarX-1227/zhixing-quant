@@ -75,6 +75,7 @@ class DailyResult:
     allow_open: bool
     max_total_pct: float
     allowed_signals: List[str] = field(default_factory=list)
+    regime_trigger: str = ""          # 最近一次区间触发的依据（无触发为空）
     # 阶段 2 防守
     reviews: List[HoldingReview] = field(default_factory=list)
     # 阶段 3 进攻
@@ -174,25 +175,17 @@ def run_daily_cycle(
 # ---------------------------------------------------------------------------
 
 def _stage_timing(cfg: dict, spot: pd.DataFrame, result: DailyResult) -> None:
-    from zhixing_quant.timing.active_value import active_value_proxy
-    from zhixing_quant.timing.regime import RegimeStateMachine
+    from zhixing_quant.timing.active_value import current_regime
     from zhixing_quant.timing.strategy_mode import get_strategy_mode
 
-    tcfg = cfg.get("timing", {})
     date_key = result.date.replace("-", "")
     try:
-        proxy = active_value_proxy(date_key, cfg)
-        score = float(proxy.get("composite_score", 0.5))
+        reg = current_regime(date_key, cfg)
     except Exception as exc:
-        score = 0.5
-        result.notes.append(f"活跃市值代理计算失败，按中性 0.5 处理：{exc}")
+        reg = {"regime": "NEUTRAL", "strength": 0.5, "pct": 0.0, "trigger": ""}
+        result.notes.append(f"活跃市值区间判断失败，按中性处理：{exc}")
 
-    sm = RegimeStateMachine(
-        bull_threshold=float(tcfg.get("bull_threshold", 0.65)),
-        bear_threshold=float(tcfg.get("bear_threshold", 0.35)),
-    )
-    state = sm.update(score)
-    mode = get_strategy_mode(state["current_regime"], state.get("regime_strength", 0.5))
+    mode = get_strategy_mode(reg["regime"], reg.get("strength", 0.5))
 
     pcfg = cfg.get("portfolio", {})
     caps = {
@@ -201,9 +194,10 @@ def _stage_timing(cfg: dict, spot: pd.DataFrame, result: DailyResult) -> None:
         "BEAR": float(pcfg.get("bear_max_total", 0.0)),
     }
 
-    result.regime = state["current_regime"]
-    result.regime_strength = float(state.get("regime_strength", 0.0))
-    result.regime_score = round(score, 4)
+    result.regime = reg["regime"]
+    result.regime_strength = float(reg.get("strength", 0.0))
+    result.regime_score = round(float(reg.get("pct", 0.0)), 4)   # 当日涨跌幅
+    result.regime_trigger = str(reg.get("trigger", ""))
     result.mode = mode.get("mode", "")
     result.allowed_signals = list(mode.get("allowed_signals", []))
     result.max_total_pct = caps.get(result.regime, 0.0)
@@ -216,9 +210,10 @@ def _stage_timing(cfg: dict, spot: pd.DataFrame, result: DailyResult) -> None:
             "规格 01.1 建议保持空头禁止开仓。"
         )
 
-    # 活跃市值是 [EXTERNAL] 数据，本地无法获取，规格 02 要求显式声明降级
+    trigger_note = f"，触发依据：{reg['trigger']}" if reg.get("trigger") else "（无新触发）"
     result.notes.append(
-        "择时使用的是活跃市值**代理指标**（规格 02 降级方案），非原始外部数据。"
+        f"活跃市值区间：{result.regime}，判断基准日 {reg.get('date', '—')}"
+        f"{trigger_note}。空头区间禁止开仓且需清仓已有持仓。"
     )
 
 
@@ -451,19 +446,17 @@ def run_daily_workflow(date: str, cfg: dict) -> ExecutionPlan:
 
     这是 run_daily_cycle 的阶段 1。需要完整决策流程时请直接调用 run_daily_cycle。
     """
-    from zhixing_quant.timing.active_value import active_value_proxy
-    from zhixing_quant.timing.regime import RegimeStateMachine
+    from zhixing_quant.timing.active_value import current_regime
     from zhixing_quant.timing.strategy_mode import get_strategy_mode
 
-    proxy = active_value_proxy(date, cfg)
-    state = RegimeStateMachine().update(proxy["composite_score"])
-    mode = get_strategy_mode(state["current_regime"], state["regime_strength"])
+    reg = current_regime(date, cfg)
+    mode = get_strategy_mode(reg["regime"], reg["strength"])
 
     actions = [f"SCAN:{s}" for s in mode["allowed_signals"]] if mode["allow_open"] else []
     return ExecutionPlan(
         date=date,
-        regime=state["current_regime"],
-        regime_strength=state["regime_strength"],
+        regime=reg["regime"],
+        regime_strength=reg["strength"],
         mode=mode["mode"],
         actions=actions,
     )

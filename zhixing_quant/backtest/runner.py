@@ -37,6 +37,7 @@ class BacktestRun:
     loaded: int = 0
     skipped: int = 0
     warnings: List[str] = field(default_factory=list)
+    regime_log: pd.DataFrame = field(default_factory=pd.DataFrame)  # 区间触发日志
 
     @property
     def drawdown(self) -> pd.Series:
@@ -141,10 +142,30 @@ def run_backtest(
 
     data = mask_signals_by_membership(data, sig_col, pools, end)
 
+    # 活跃市值区间（择时）：BEAR 日引擎会禁止开仓并在开盘清仓。
+    # regime_before 把收盘态平移到次日，保证无未来函数。
+    from zhixing_quant.timing.active_value import oamv_trigger_states, regime_before
+    states = oamv_trigger_states(cfg)
+    all_days = sorted({ts for frame in data.values() for ts in frame.index})
+    regime_map = regime_before(all_days, states)
+
     engine = BacktestEngine(cfg)
-    result = engine.run(data, signal_col=sig_col, start_date=start, end_date=end)
+    result = engine.run(data, signal_col=sig_col, start_date=start, end_date=end,
+                        regime=regime_map)
 
     warnings.extend(survivorship_warnings(get_store()))
+
+    win = states[(states.trade_date >= int(start)) & (states.trade_date <= int(end))]
+    n_bear = int((win.regime == "BEAR").sum())
+    n_bull = int((win.regime == "BULL").sum())
+    if n_bear:
+        forced = result.metrics.get("bear_forced_exits", 0)
+        warnings.append(
+            f"活跃市值空头区间 {n_bear} 个交易日（多头 {n_bull} 日）："
+            f"期间禁止开仓，强制清仓 {forced} 笔。"
+        )
+    regime_log = win.loc[win.trigger != "", ["trade_date", "close", "pct",
+                                             "trigger", "regime"]]
 
     bench, bench_used = _load_benchmark(benchmark_code, start, end,
                                         result.equity_curve)
@@ -171,6 +192,7 @@ def run_backtest(
         loaded=len(data),
         skipped=skipped,
         warnings=warnings,
+        regime_log=regime_log.reset_index(drop=True),
     )
 
 

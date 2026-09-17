@@ -102,6 +102,7 @@ class BacktestEngine:
         exit_fn: Optional[Callable] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        regime: Optional[Dict[str, str]] = None,
     ) -> BacktestResult:
         """跑一次回测。
 
@@ -114,6 +115,9 @@ class BacktestEngine:
             exit_fn: 可选自定义卖出判断 (df, idx, position) -> Optional[str]，
                      返回卖出原因字符串表示卖出。
             start_date / end_date: YYYYMMDD。
+            regime: {"YYYY-MM-DD": "BULL"/"BEAR"/"NEUTRAL"}，各交易日开盘时可知的
+                    活跃市值区间（由 T-1 及之前的活跃市值收盘决定，无未来函数）。
+                    BEAR 日：禁止开新仓，已有持仓当日开盘强制清仓。
 
         Returns:
             BacktestResult
@@ -129,6 +133,9 @@ class BacktestEngine:
         if len(calendar) < 2:
             return BacktestResult(metrics=compute_metrics([], []))
 
+        regime_map = regime or {}
+        bear_days = 0
+
         cash = self.initial_capital
         positions: Dict[str, Position] = {}
         trades: List[Trade] = []
@@ -139,6 +146,15 @@ class BacktestEngine:
 
         for day_i, date in enumerate(calendar):
             date_str = date.strftime("%Y-%m-%d")
+
+            # --- 0. 区间闸门：空头日开盘清掉全部持仓，全天禁止开新仓 ---
+            if regime_map.get(date_str, "NEUTRAL") == "BEAR":
+                bear_days += 1
+                for code, pos in positions.items():
+                    pos.__dict__["_exit_reason"] = "空头区间清仓"
+                    if code not in pending_exits:
+                        pending_exits.append(code)
+                pending_entries = []      # 昨日收盘生成的买单一律作废
 
             # --- 1. 开盘：先卖后买 ---
             for code in list(pending_exits):
@@ -254,8 +270,10 @@ class BacktestEngine:
             daily_positions.append({"date": date_str, "cash": round(cash, 2),
                                     "equity": round(equity, 2), "positions": snapshot})
 
-            # 生成明日买单
-            if day_i < len(calendar) - 1 and len(positions) < self.max_positions:
+            # 生成明日买单（明日开盘即知为空头区间则不生成）
+            if (day_i < len(calendar) - 1 and len(positions) < self.max_positions
+                    and regime_map.get(
+                        calendar[day_i + 1].strftime("%Y-%m-%d"), "NEUTRAL") != "BEAR"):
                 signals = self._signals_on(prepared, date, signal_col)
                 for code, info in signals[: self.max_entries_per_day]:
                     if code not in positions:
@@ -272,6 +290,10 @@ class BacktestEngine:
         metrics["total_return"] = (
             round(equity_values[-1] / self.initial_capital - 1, 4) if equity_values else 0.0
         )
+        if regime_map:
+            metrics["bear_regime_days"] = bear_days
+            metrics["bear_forced_exits"] = sum(
+                1 for t in trades if t.exit_reason == "空头区间清仓")
         return BacktestResult(
             trades=trades, equity_curve=equity_curve,
             metrics=metrics, daily_positions=daily_positions,

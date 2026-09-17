@@ -39,10 +39,15 @@ STRATEGY_PARAMS: Dict[str, List[Param]] = {
               "砖型图快线周期"),
         Param("brick.n2", "长周期 N2", "int", 6, 3, 20, 1,
               "砖型图慢线周期"),
-        Param("brick.min_brick_height", "砖高绝对下限", "float", 4.0, 0.0, 20.0, 0.5,
-              "附录 B.5 的「砖型图 > 4」。调低会放行贴地的微红盘"),
-        Param("brick.min_brick_growth", "砖高增长倍数", "float", 1.5, 1.0, 3.0, 0.1,
-              "今日砖高 ÷ 昨日砖高 的下限。附录 B.5 给 1.5"),
+        Param("brick.min_height_ratio", "红柱/绿柱高度比", "float", 0.6667, 0.1, 2.0, 0.05,
+              "红柱高度 >= 绿柱高度 × 此值。通达信原公式为 2/3，改它等于换掉"
+              "选股条件本身", tag="LOCKED"),
+        Param("brick.min_brick_height", "砖高绝对下限(附加)", "float", 0.0, 0.0, 20.0, 0.5,
+              "通达信公式之外的可选门槛，0 = 关闭。砖高实测常年 20 以上，"
+              "设成 4 几乎不起过滤作用"),
+        Param("brick.min_brick_growth", "砖高增长倍数(附加)", "float", 0.0, 0.0, 3.0, 0.1,
+              "通达信公式之外的可选门槛，0 = 关闭。设成 1.5 是要求慢速振荡"
+              "指标单日跳涨 50%，实测只有 0.3% 的红柱日能满足"),
     ],
     "b1": [
         Param("b1.j_threshold", "J值上限", "float", 13.0, 0.0, 40.0, 1.0,
@@ -91,8 +96,9 @@ EXECUTION_PARAMS: List[Param] = [
     Param("backtest.max_positions", "最大持仓数", "int", 5, 1, 20, 1,
           "同时最多持有几只"),
     Param("backtest.max_entries_per_day", "每日最多开仓", "int", 2, 1, 10, 1),
-    Param("backtest.max_holding_days", "最长持有(交易日)", "int", 20, 3, 120, 1,
-          "超过就无条件卖出"),
+    # 「最长持有」已移到「出场规则」页签（exits.<战法>.time_stop.max_holding_days）。
+    # 留在这里会变成又一个改了不生效的死参数：引擎一旦收到 exit_policy，
+    # 内置的 max_holding_days 分支就不再走了。
 ]
 
 COST_PARAMS: List[Param] = [
@@ -102,6 +108,72 @@ COST_PARAMS: List[Param] = [
     Param("backtest.slippage", "滑点", "float", 0.0015, 0.0, 0.01, 0.0005,
           "调低会让回测结果虚高。真实成交价通常比理想价差 0.1%~0.3%"),
 ]
+
+# ---------------------------------------------------------------------------
+# 出场规则（止损 / 移动止损 / 止盈 / 时间止损）
+#
+# 键是按战法动态拼的：exits.<战法>.stop.kind 之类。配置层做深合并，
+# 界面上只写 exits.<战法> 这一层，没写到的键自动从 exits.default 继承。
+# ---------------------------------------------------------------------------
+
+STOP_KINDS = ("entry_low", "pct", "atr", "none")
+TRAIL_KINDS = ("none", "pct", "chandelier", "yellow_line")
+TP_KINDS = ("pct", "none", "tiered")
+
+_KIND_LABEL = {
+    "entry_low": "入场K线最低价", "pct": "固定百分比", "atr": "ATR 倍数",
+    "none": "不设", "chandelier": "吊灯(最高价-ATR)", "yellow_line": "知行多空线",
+    "tiered": "分级减仓(红砖)",
+}
+
+
+def kind_label(value: str) -> str:
+    return _KIND_LABEL.get(str(value), str(value))
+
+
+def exit_params_for(strategy: str, cfg: dict) -> List[Param]:
+    """某个战法的出场规则参数。默认值取该战法合并后的实际生效值。"""
+    from zhixing_quant.backtest.exits import spec_from_config
+
+    spec = spec_from_config(cfg, strategy)
+    k = f"exits.{strategy}"
+    return [
+        Param(f"{k}.stop.kind", "止损方式", "choice", spec.stop.kind,
+              choices=STOP_KINDS,
+              help="entry_low 贴着信号日最低价，离成本很近，容易被正常波动扫掉"),
+        Param(f"{k}.stop.pct", "止损百分比", "float", spec.stop.pct, 0.01, 0.30, 0.01,
+              "止损方式选「固定百分比」时生效"),
+        Param(f"{k}.stop.atr_mult", "止损 ATR 倍数", "float", spec.stop.atr_mult,
+              0.5, 6.0, 0.5, "止损方式选「ATR 倍数」时生效"),
+        Param(f"{k}.trailing.kind", "移动止损", "choice", spec.trail.kind,
+              choices=TRAIL_KINDS,
+              help="只上移不下移。没有移动止损，浮盈会一路还回去"),
+        Param(f"{k}.trailing.pct", "移动止损回撤", "float", spec.trail.pct,
+              0.02, 0.40, 0.01, "从持仓期间最高价回撤多少就走"),
+        Param(f"{k}.trailing.activate_profit", "移动止损启用浮盈", "float",
+              spec.trail.activate_profit, 0.0, 0.50, 0.01,
+              "浮盈达到此比例后才启用，0 = 建仓即启用"),
+        Param(f"{k}.take_profit.kind", "止盈方式", "choice", spec.take_profit.kind,
+              choices=TP_KINDS,
+              help="tiered 走 config 里的 tiers（四块砖止盈定律）"),
+        Param(f"{k}.take_profit.pct", "止盈百分比", "float", spec.take_profit.pct,
+              0.03, 1.0, 0.01, "止盈方式选「固定百分比」时生效"),
+        Param(f"{k}.time_stop.max_holding_days", "最长持有(交易日)", "int",
+              spec.time_stop.max_holding_days, 0, 250, 1, "0 = 不限"),
+        Param(f"{k}.time_stop.no_progress_days", "不涨就走(N日)", "int",
+              spec.time_stop.no_progress_days, 0, 60, 1,
+              "持有 N 日涨幅不足下面那个门槛就离场，0 = 关闭"),
+        Param(f"{k}.time_stop.min_progress", "N日最低涨幅", "float",
+              spec.time_stop.min_progress, -0.2, 0.5, 0.01),
+        Param(f"{k}.break_yellow_line", "跌破黄线清仓", "bool",
+              spec.break_yellow_line,
+              help="规格 01.3 [LOCKED]：跌破知行多空线清仓并移出股票池"),
+        Param(f"{k}.defense_ladder", "启用防守八级阶梯", "bool", spec.defense_ladder,
+              help="需要 S系列/出货/MACD 等指标列，回测流水线里不一定都有"),
+        Param(f"{k}.strategy_exit", "调用战法自身出场", "bool", spec.strategy_exit,
+              help="走 Strategy.exit_conditions"),
+    ]
+
 
 RISK_PARAMS: List[Param] = [
     Param("portfolio.risk_per_trade", "单笔风险", "float", 0.02, 0.002, 0.10, 0.002,
@@ -143,11 +215,17 @@ def apply_overrides(cfg: dict, overrides: Dict[str, Any]) -> dict:
     return out
 
 
-def diff_from_default(overrides: Dict[str, Any]) -> Dict[str, Any]:
-    """只保留与声明默认值不同的项，用于在界面上显示"你改了什么"。"""
+def diff_from_default(overrides: Dict[str, Any],
+                      extra: Sequence[Param] = ()) -> Dict[str, Any]:
+    """只保留与声明默认值不同的项，用于在界面上显示"你改了什么"。
+
+    Args:
+        overrides: 界面收集到的全部覆盖值。
+        extra: 动态生成的参数声明（出场规则那组的键带战法名，不在静态表里）。
+    """
     defaults = {}
     for group in list(STRATEGY_PARAMS.values()) + [EXECUTION_PARAMS, COST_PARAMS,
-                                                   RISK_PARAMS]:
+                                                   RISK_PARAMS, list(extra)]:
         for p in group:
             defaults[p.key] = p.default
     return {k: v for k, v in overrides.items()

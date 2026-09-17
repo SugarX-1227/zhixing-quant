@@ -40,7 +40,14 @@ class DefenseEngine:
         Returns:
             ExitSignal if any rule triggers, else None.
         """
-        row = df.iloc[idx]
+        return self.evaluate_row(df.iloc[idx], pos)
+
+    def evaluate_row(self, row, pos: dict) -> Optional[ExitSignal]:
+        """Same ladder, but against an already-extracted row.
+
+        回测主循环每根 K 线都要走一遍阶梯，`df.iloc[idx]` 每次构造一个
+        Series 是纯开销。出场规则层已经拿到行了，直接传进来。
+        """
         checks = [
             self._check_take_profit(row, pos),
             self._check_stop_loss(row, pos),

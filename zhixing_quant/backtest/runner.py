@@ -38,6 +38,7 @@ class BacktestRun:
     skipped: int = 0
     warnings: List[str] = field(default_factory=list)
     regime_log: pd.DataFrame = field(default_factory=pd.DataFrame)  # 区间触发日志
+    exit_note: str = ""            # 本次实际生效的出场规则，界面要显示出来
 
     @property
     def drawdown(self) -> pd.Series:
@@ -149,9 +150,14 @@ def run_backtest(
     all_days = sorted({ts for frame in data.values() for ts in frame.index})
     regime_map = regime_before(all_days, states)
 
+    # 出场规则：回测与实盘共用 config 的 exits 段，见 backtest/exits.py。
+    # 不再是写死的「信号日低点止损 + 15% 止盈 + 满 20 日清仓」。
+    from zhixing_quant.backtest.exits import policy_from_config, spec_from_config
+    exit_policy = policy_from_config(cfg, strategy)
+
     engine = BacktestEngine(cfg)
     result = engine.run(data, signal_col=sig_col, start_date=start, end_date=end,
-                        regime=regime_map)
+                        regime=regime_map, exit_policy=exit_policy)
 
     warnings.extend(survivorship_warnings(get_store()))
 
@@ -193,6 +199,7 @@ def run_backtest(
         skipped=skipped,
         warnings=warnings,
         regime_log=regime_log.reset_index(drop=True),
+        exit_note=spec_from_config(cfg, strategy).describe(),
     )
 
 

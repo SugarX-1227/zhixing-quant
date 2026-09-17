@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from zhixing_quant.indicators.brick import add_brick_indicators, brick_signal_columns
 from zhixing_quant.indicators.tdx import sma_tdx
@@ -45,53 +46,99 @@ def test_brick_signal_requires_yesterday_green_today_red_height_and_yellow():
     assert result["abandon_gap_up_price"].iloc[-1] == result["close"].iloc[-1] * 1.07
 
 
-def test_green_to_strong_red_matches_appendix_b5():
-    """附录 B.5：强度确认 = 砖高 > 4 AND 砖高 > 昨日砖高 × 1.5。"""
-    # 10 → 4（绿）→ 8（红）。8 > 4 且 8 > 4×1.5=6，两道门槛都过。
-    result = brick_signal_columns(pd.Series([10.0, 4.0, 8.0]))
+def test_green_to_strong_red_matches_the_tdx_formula():
+    """通达信原文：红柱高度 >= 绿柱高度 × 2/3。
+
+    30 → 10 → 25：绿柱高度 = 30-10 = 20，红柱高度 = 25-10 = 15。
+    15 >= 20 × 2/3 = 13.33 → 达标。
+    """
+    result = brick_signal_columns(pd.Series([30.0, 10.0, 25.0]))
 
     assert bool(result["brick_yesterday_green"].iloc[-1])
     assert bool(result["brick_today_red"].iloc[-1])
-    assert bool(result["brick_strong_abs"].iloc[-1])
-    assert bool(result["brick_strong_rel"].iloc[-1])
+    assert result["brick_green_height"].iloc[-1] == pytest.approx(20.0)
+    assert result["brick_red_height"].iloc[-1] == pytest.approx(15.0)
     assert bool(result["brick_height_ok"].iloc[-1])
 
 
-def test_micro_red_is_rejected_by_absolute_floor():
-    """防微红盘：砖高从 0.1 涨到 0.5，涨了 5 倍，但绝对高度不到 4。
-
-    这正是原实现（今日涨幅 >= 昨日跌幅 × 2/3）会放行、
-    而作者在公式注释里明说要挡掉的情况。
-    """
-    result = brick_signal_columns(pd.Series([2.0, 0.1, 0.5]))
+def test_weak_red_below_two_thirds_is_rejected():
+    """30 → 10 → 20：红柱高度 10 < 20 × 2/3 = 13.33，不达标。"""
+    result = brick_signal_columns(pd.Series([30.0, 10.0, 20.0]))
 
     assert bool(result["brick_today_red"].iloc[-1])
-    assert bool(result["brick_strong_rel"].iloc[-1]), "0.5 > 0.1×1.5，相对强度是够的"
-    assert not bool(result["brick_strong_abs"].iloc[-1]), "但砖高 0.5 < 4"
     assert not bool(result["brick_height_ok"].iloc[-1])
 
 
-def test_slow_climb_is_rejected_by_relative_floor():
-    """缓慢爬升：砖高 20 → 21，绝对够高但增长不到 1.5 倍。"""
-    result = brick_signal_columns(pd.Series([25.0, 20.0, 21.0]))
+def test_yesterday_green_requires_strict_decline():
+    """通达信是 REF(砖型图,1) < REF(砖型图,2)，严格小于。
 
-    assert bool(result["brick_strong_abs"].iloc[-1])
-    assert not bool(result["brick_strong_rel"].iloc[-1])
-    assert not bool(result["brick_height_ok"].iloc[-1])
-
-
-def test_old_two_thirds_misreading_is_gone():
-    """回归锁：确保不会有人把 2/3 那套改回来。
-
-    砖高 30 → 10（跌 20）→ 22（涨 12）。
-    旧规则：涨幅 12 >= 跌幅 20 × 2/3 = 13.33 → False，本来就不过。
-    换个数：30 → 10 → 25，涨幅 15 >= 13.33 → 旧规则 True。
-    新规则：25 > 10×1.5 = 15 → 也 True。两者在这里一致，所以用
-    下面这组把它们分开：20 → 18 → 26，涨幅 8 >= 跌幅 2×2/3 → 旧规则 True，
-    而 26 > 18×1.5 = 27 不成立 → 新规则 False。
+    旧实现用 ~ref(today_red,1)，等价于 <=，会把「昨日持平」也算成绿柱。
     """
-    result = brick_signal_columns(pd.Series([20.0, 18.0, 26.0]))
+    flat = brick_signal_columns(pd.Series([20.0, 20.0, 25.0]))
+    assert not bool(flat["brick_yesterday_green"].iloc[-1]), \
+        "昨日持平不是绿柱，通达信用的是严格小于"
 
-    assert bool(result["brick_today_red"].iloc[-1])
-    assert not bool(result["brick_height_ok"].iloc[-1]), \
-        "26 没到 18×1.5=27，按附录 B.5 不该放行"
+    down = brick_signal_columns(pd.Series([20.0, 19.0, 25.0]))
+    assert bool(down["brick_yesterday_green"].iloc[-1])
+
+
+def test_the_x15_misreading_stays_gone():
+    """回归锁：旧实现是「砖高>4 且 砖高>昨日砖高×1.5」，比的是水平值不是增量。
+
+    实测 50 只 × 2.8 年，旧实现只有 1 次信号，通达信公式有 1553 次；
+    规划书 6.8 的验收标准是 200-400 次/年。砖型图本该是信号最多的一套。
+    """
+    # 砖高 100 → 80 → 95：绿柱高度 20，红柱高度 15 >= 13.33 → 通达信放行。
+    # 旧实现要求 95 > 80×1.5 = 120 → 拒绝。这组能把两者分开。
+    result = brick_signal_columns(pd.Series([100.0, 80.0, 95.0]))
+    assert bool(result["brick_height_ok"].iloc[-1]), \
+        "又被改回成比水平值了——砖型图会重新退化成哑战法"
+
+
+def test_optional_extra_gates_are_off_by_default():
+    """min_brick_height / min_brick_growth 不属于通达信公式，默认必须不生效。"""
+    default = brick_signal_columns(pd.Series([100.0, 80.0, 95.0]))
+    assert bool(default["brick_height_ok"].iloc[-1])
+
+    gated = brick_signal_columns(pd.Series([100.0, 80.0, 95.0]),
+                                 min_brick_growth=1.5)
+    assert not bool(gated["brick_height_ok"].iloc[-1]), "附加门槛没起作用"
+
+
+def test_shipped_config_uses_the_tdx_ratio():
+    from zhixing_quant.config import load_config
+
+    brick = load_config()["brick"]
+    assert brick["min_height_ratio"] == pytest.approx(2 / 3, abs=1e-3)
+    assert float(brick["min_brick_height"]) == 0.0, "附加门槛应默认关闭"
+    assert float(brick["min_brick_growth"]) == 0.0
+
+
+def test_brick_signal_fires_at_a_usable_rate_on_trending_data():
+    """砖型图在实盘里是信号最多的战法。构造一段有涨有跌的行情，
+    整段一次都不触发就说明判据又被卡死了。"""
+    import numpy as np
+
+    rng = np.random.default_rng(3)
+    n = 400
+    close = np.clip(30 + np.cumsum(rng.normal(0.02, 0.8, n)), 5, None)
+    prev = np.concatenate([[30.0], close[:-1]])
+    df = pd.DataFrame(
+        {
+            "open": prev,
+            "high": np.maximum(close, prev) + abs(rng.normal(0, .3, n)),
+            "low": np.minimum(close, prev) - abs(rng.normal(0, .3, n)),
+            "close": close,
+            "vol": [1e6] * n,
+            "amount": [1e8] * n,
+        },
+        index=pd.date_range("2024-01-01", periods=n, freq="B"),
+    )
+    hits = int(add_brick_indicators(df, load_shipped_cfg())["sig_brick"].sum())
+    assert hits > 5, f"400 根 K 线只触发 {hits} 次，判据又被卡死了"
+
+
+def load_shipped_cfg() -> dict:
+    from zhixing_quant.config import load_config
+
+    return load_config()

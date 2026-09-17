@@ -61,6 +61,11 @@ def _param_widget(p: PS.Param, cfg: dict, key: str):
                           if p.tag == "LOCKED" else "")) or None
     if p.kind == "bool":
         return st.checkbox(label, value=bool(cur), key=key, help=help_txt)
+    if p.kind == "choice":
+        opts = list(p.choices)
+        idx = opts.index(cur) if cur in opts else 0
+        return st.selectbox(label, opts, index=idx, key=key, help=help_txt,
+                            format_func=PS.kind_label)
     if p.kind == "int":
         return int(st.number_input(label, int(p.lo), int(p.hi), int(cur),
                                    int(p.step or 1), key=key, help=help_txt))
@@ -302,7 +307,7 @@ def page_backtest(cfg, book):
         st.caption(f"暂不支持回测：{'、'.join(blocked)}"
                    "（信号需逐根K线求值，引擎读的是预算好的信号列）")
 
-    tabs = st.tabs(["股票池", "战法参数", "交易规则", "成本与风控"])
+    tabs = st.tabs(["股票池", "战法参数", "出场规则", "交易规则", "成本与风控"])
 
     with tabs[0]:
         u = st.columns([2, 1, 1, 1])
@@ -333,13 +338,22 @@ def page_backtest(cfg, book):
         else:
             st.caption("这套战法没有声明可调参数。")
 
+    exit_params = PS.exit_params_for(name, cfg)
     with tabs[2]:
+        st.caption("止损 / 移动止损 / 止盈 / 时间止损。回测引擎和实盘防守读同一份规则，"
+                   "改这里两边同时生效。没改到的项从 `exits.default` 继承。")
+        cols = st.columns(4)
+        for i, p in enumerate(exit_params):
+            with cols[i % 4]:
+                overrides[p.key] = _param_widget(p, cfg, f"bt_xt_{p.key}")
+
+    with tabs[3]:
         cols = st.columns(4)
         for i, p in enumerate(PS.EXECUTION_PARAMS):
             with cols[i % 4]:
                 overrides[p.key] = _param_widget(p, cfg, f"bt_ex_{p.key}")
 
-    with tabs[3]:
+    with tabs[4]:
         cols = st.columns(3)
         for i, p in enumerate(PS.COST_PARAMS):
             with cols[i % 3]:
@@ -364,7 +378,7 @@ def page_backtest(cfg, book):
             st.error(f"回测失败：{exc}")
             return
         bar.empty()
-        st.session_state["bt"] = (run, PS.diff_from_default(overrides))
+        st.session_state["bt"] = (run, PS.diff_from_default(overrides, exit_params))
 
     got = st.session_state.get("bt")
     if got is None:
@@ -378,6 +392,8 @@ def page_backtest(cfg, book):
         st.warning(w)
     st.caption(f"股票池：{run.universe_note}　|　实际回测 {run.loaded} 只"
                + (f"，跳过 {run.skipped} 只（K线不足）" if run.skipped else ""))
+    if getattr(run, "exit_note", ""):
+        st.caption(f"出场规则：{run.exit_note}")
     if changed:
         st.caption("改动的参数：" + "、".join(f"`{k}`={v}" for k, v in changed.items()))
 

@@ -54,6 +54,19 @@ def ma(series: pd.Series, n: int) -> pd.Series:
     return series.rolling(n, min_periods=1).mean()
 
 
+def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    """TR = max(H-L, |H-PC|, |L-PC|)。"""
+    pre_close = close.shift(1)
+    return pd.concat(
+        [high - low, (high - pre_close).abs(), (low - pre_close).abs()], axis=1
+    ).max(axis=1)
+
+
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14) -> pd.Series:
+    """ATR(N)。全项目唯一定义——止损位和关键K线都读这里，不各算各的。"""
+    return true_range(high, low, close).rolling(n, min_periods=1).mean()
+
+
 def ema(series: pd.Series, span: int) -> pd.Series:
     """TongDaXin EMA(X, N): exponential moving average."""
     return pd.to_numeric(series, errors="coerce").ewm(span=span, adjust=False).mean()

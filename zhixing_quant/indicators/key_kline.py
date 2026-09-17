@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pandas as pd
 
-from zhixing_quant.indicators.tdx import (hhv, llv, ma, ref, zhixing_white,
-                                          zhixing_yellow)
+from zhixing_quant.indicators.tdx import (atr as atr_of, hhv, llv, ma, ref,
+                                          zhixing_white, zhixing_yellow)
 
 
 def detect_key_k(df: pd.DataFrame, atr_window: int = 14, lookback: int = 60) -> pd.DataFrame:
@@ -31,12 +31,8 @@ def detect_key_k(df: pd.DataFrame, atr_window: int = 14, lookback: int = 60) -> 
     low = pd.to_numeric(out["low"], errors="coerce")
     pre_close = pd.to_numeric(ref(close, 1), errors="coerce")
 
-    # ATR
-    tr1 = high - low
-    tr2 = (high - pre_close).abs()
-    tr3 = (low - pre_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.rolling(atr_window, min_periods=1).mean()
+    # ATR：走 tdx.atr，避免出场规则层和这里各算一份（数学完全相同）
+    atr = atr_of(high, low, close, atr_window)
 
     # Candlestick body and shadows
     body = (close - open_).abs()

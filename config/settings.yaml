@@ -47,11 +47,18 @@ report:
 brick:
   n1: 4
   n2: 6
-  # 绿转强红（附录 B.5）：砖高 > 4 且 砖高 > 昨日砖高 × 1.5。
-  # 原 min_height_ratio: 0.6667 是课程口语"覆盖前一根绿柱 2/3"的误读，
-  # 拿今日涨幅比昨日跌幅，且缺了"砖高 > 4"这道防微红盘的门槛，已移除。
-  min_brick_height: 4.0
-  min_brick_growth: 1.5
+  # 绿转强红：红柱高度 >= 绿柱高度 × 2/3。
+  # 这是使用者每天在通达信里实跑的那份选股公式的原文，仓库里
+  # 通达信行情指标与选股指标(1).md 与 知行量化系统开发规划.docx 3.6 都一致。
+  #
+  # 2026-09 之前这里写的是「砖高 > 4 且 砖高 > 昨日砖高 × 1.5」，出处标的是
+  # 一份不在本仓库的文档。它把「两个增量相比」错成「两个水平值相比」，
+  # 又把 砖型图:=IF(VAR6A>4,VAR6A-4,0) 里已经扣过的 4 再要求一遍。
+  # 实测 50 只 × 2.8 年：正确公式 1553 次信号，错误实现 1 次。
+  min_height_ratio: 0.6667
+  # 以下两项是可选附加门槛，0 = 关闭，不属于通达信公式
+  min_brick_height: 0.0
+  min_brick_growth: 0.0
   take_profit:
     red_streak_2: 0.10
     red_streak_3: 0.30
@@ -156,6 +163,88 @@ backtest:
   max_positions: 5
   max_holding_days: 20
   max_entries_per_day: 2
+
+# ---------------------------------------------------------------------------
+# 出场规则（止损 / 移动止损 / 止盈 / 时间止损）
+#
+# 回测引擎和实盘防守都读这一段，改一处两边同时生效。
+# `default` 是所有战法的缺省，`<战法名>` 逐项覆盖（深合并，只写要改的键）。
+#
+# 在此之前回测的出场是写死的：信号日低点止损 + 15% 固定止盈 + 满 20 日清仓，
+# 战法自己的 exit_conditions 一次都没被调用过。default 段刻意保持与那套
+# 写死规则一致，这样加上 exits 段之后老结果仍可复现；要改行为就往下面的
+# 战法段里写。
+# ---------------------------------------------------------------------------
+exits:
+  default:
+    stop:
+      kind: entry_low      # entry_low / pct / atr / none
+      pct: 0.08            # kind=pct 时生效
+      atr_mult: 2.0        # kind=atr 时生效
+      atr_window: 14
+      buffer: 0.0          # 止损价再向下让出的比例，防日内插针扫损
+      cap_pct: 0.99        # 止损价上限 = 入场价 × 此值，不许贴着成本
+    trailing:
+      kind: none           # none / pct / chandelier / yellow_line
+      pct: 0.10
+      atr_mult: 3.0
+      activate_profit: 0.0 # 浮盈达到此比例后才启用移动止损
+    take_profit:
+      kind: pct            # pct / none / tiered
+      pct: 0.15
+    time_stop:
+      max_holding_days: 20
+      no_progress_days: 0  # 持仓 N 日涨幅不足 min_progress 就走，0=关闭
+      min_progress: 0.0
+    break_yellow_line: false
+    defense_ladder: false  # 启用 portfolio/defense.py 八级阶梯
+    strategy_exit: false   # 调用战法自身 exit_conditions
+
+  # 砖型图：规划书 6.4.2「四块砖止盈定律」——连 2 根减 10%、连 3 根减 30%、
+  # 连 4 根清仓；跌破入场 K 线低点或跌破黄线全清。
+  brick:
+    stop:
+      kind: entry_low
+    take_profit:
+      kind: tiered
+      tiers:
+        2: 0.10
+        3: 0.30
+        4: 1.00
+    time_stop:
+      max_holding_days: 6
+    break_yellow_line: true
+
+  # B1 是阶段性低点，止损天然取信号日最低价，但那条线离成本太近——
+  # 实测 362 笔里 285 笔止损、中位持有 1 天。这里放宽到 ATR 止损 + 吊灯移动止损。
+  b1:
+    stop:
+      kind: atr
+      atr_mult: 2.0
+    trailing:
+      kind: chandelier
+      atr_mult: 3.0
+      activate_profit: 0.05
+    take_profit:
+      kind: none
+    time_stop:
+      max_holding_days: 30
+    break_yellow_line: true
+
+  b2:
+    stop:
+      kind: atr
+      atr_mult: 2.5
+    trailing:
+      kind: pct
+      pct: 0.12
+      activate_profit: 0.08
+    take_profit:
+      kind: pct
+      pct: 0.20
+    time_stop:
+      max_holding_days: 20
+    break_yellow_line: true
 
 strategies:
   brick:

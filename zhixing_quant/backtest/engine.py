@@ -48,10 +48,24 @@ class Position:
     entry_date: str
     entry_price: float
     shares: int
-    cost_basis: float          # 含买入费用的总成本
+    cost_basis: float          # 含买入费用的总成本（按当前剩余股数摊销）
     stop_loss: float
     take_profit: float
     bars_held: int = 0
+    entry_shares: int = 0      # 建仓股数，分批减仓后 shares 会小于它
+    entry_low: float = 0.0     # 建仓那根 K 线的最低价，防守阶梯 P2 要用
+    highest_high: float = 0.0  # 持仓期间最高价，移动止损的锚
+    tier_done: int = 0         # 分级止盈已经执行到第几档
+    exit_reason: str = ""      # 收盘型规则挂出的卖出理由
+
+    def as_dict(self) -> dict:
+        """交给防守阶梯 / 战法 exit_conditions 的持仓视图。"""
+        return {
+            "code": self.code, "entry_date": self.entry_date,
+            "entry_price": self.entry_price, "shares": self.shares,
+            "stop_loss": self.stop_loss, "take_profit": self.take_profit,
+            "entry_low": self.entry_low, "bars_held": self.bars_held,
+        }
 
 
 @dataclass
@@ -70,6 +84,12 @@ class BacktestResult:
                 ]
             )
         return pd.DataFrame([t.__dict__ for t in self.trades])
+
+
+def _tier_of(reason: str) -> int:
+    """从「连3根红砖减仓」这类理由里取出档位数字，用于记录已执行到第几档。"""
+    digits = "".join(ch for ch in reason if ch.isdigit())
+    return int(digits) if digits else 0
 
 
 class BacktestEngine:
@@ -103,6 +123,7 @@ class BacktestEngine:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         regime: Optional[Dict[str, str]] = None,
+        exit_policy=None,
     ) -> BacktestResult:
         """跑一次回测。
 
@@ -113,7 +134,11 @@ class BacktestEngine:
             stop_col: 止损价列名，缺失时用当日 low。
             take_profit_pct: 止盈比例。
             exit_fn: 可选自定义卖出判断 (df, idx, position) -> Optional[str]，
-                     返回卖出原因字符串表示卖出。
+                     返回卖出原因字符串表示卖出。exit_policy 优先。
+            exit_policy: backtest/exits.ExitPolicy。给了就用它决定止损价、
+                     止盈价、移动止损和收盘型出场，`take_profit_pct` 与内置
+                     的「满 N 日清仓」一并让位。不给则保持旧行为
+                     （信号日低点止损 + 固定百分比止盈 + max_holding_days）。
             start_date / end_date: YYYYMMDD。
             regime: {"YYYY-MM-DD": "BULL"/"BEAR"/"NEUTRAL"}，各交易日开盘时可知的
                     活跃市值区间（由 T-1 及之前的活跃市值收盘决定，无未来函数）。
@@ -128,6 +153,11 @@ class BacktestEngine:
         prepared = self._prepare(price_data, signal_col, stop_col, start_date, end_date)
         if not prepared:
             return BacktestResult(metrics=compute_metrics([], []))
+
+        if exit_policy is not None:
+            from zhixing_quant.backtest.exits import ExitFrame
+            for item in prepared.values():
+                item["ef"] = ExitFrame(item["df"])
 
         calendar = self._build_calendar(prepared)
         if len(calendar) < 2:
@@ -151,7 +181,8 @@ class BacktestEngine:
             if regime_map.get(date_str, "NEUTRAL") == "BEAR":
                 bear_days += 1
                 for code, pos in positions.items():
-                    pos.__dict__["_exit_reason"] = "空头区间清仓"
+                    pos.exit_reason = "空头区间清仓"
+                    pos.__dict__["_exit_portion"] = 1.0   # 清仓，覆盖任何分批指令
                     if code not in pending_exits:
                         pending_exits.append(code)
                 pending_entries = []      # 昨日收盘生成的买单一律作废
@@ -166,24 +197,15 @@ class BacktestEngine:
                 if self._is_limit_down_open(prepared, code, date):
                     continue          # 一字跌停卖不出，明天继续挂
                 price = self._fill_price(bar["open"], "SELL")
-                proceeds, fee = self._sell_proceeds(price, pos.shares)
-                cash += proceeds
-                pnl = proceeds - pos.cost_basis
-                trades.append(
-                    Trade(
-                        code=code,
-                        entry_date=pos.entry_date,
-                        exit_date=date_str,
-                        entry_price=pos.entry_price,
-                        exit_price=price,
-                        shares=pos.shares,
-                        pnl=round(pnl, 2),
-                        return_pct=pnl / pos.cost_basis if pos.cost_basis > 0 else 0.0,
-                        exit_reason=pos.__dict__.pop("_exit_reason", "signal"),
-                        holding_days=pos.bars_held,
-                    )
-                )
-                del positions[code]
+                portion = float(pos.__dict__.pop("_exit_portion", 1.0))
+                shares = self._portion_shares(pos, portion)
+                reason = pos.exit_reason or "signal"
+                pos.exit_reason = ""
+                if shares <= 0:
+                    pending_exits.remove(code)
+                    continue
+                cash += self._book_sale(trades, positions, pos, price, shares,
+                                        date_str, reason)
                 pending_exits.remove(code)
 
             for order in list(pending_entries):
@@ -207,15 +229,23 @@ class BacktestEngine:
                 if cost > cash:
                     continue
                 cash -= cost
-                stop = order["stop"] if order["stop"] > 0 else bar["low"] * 0.97
+                if exit_policy is not None:
+                    stop, take = exit_policy.initial_levels(
+                        prepared[code]["ef"], bar["i"], price)
+                else:
+                    raw = order["stop"] if order["stop"] > 0 else bar["low"] * 0.97
+                    stop, take = min(raw, price * 0.99), price * (1 + take_profit_pct)
                 positions[code] = Position(
                     code=code,
                     entry_date=date_str,
                     entry_price=price,
                     shares=shares,
                     cost_basis=cost,
-                    stop_loss=min(stop, price * 0.99),
-                    take_profit=price * (1 + take_profit_pct),
+                    stop_loss=stop,
+                    take_profit=take,
+                    entry_shares=shares,
+                    entry_low=bar["low"],
+                    highest_high=bar["high"],
                 )
             pending_entries = []
 
@@ -230,19 +260,8 @@ class BacktestEngine:
                 if not hit:
                     continue
                 fill = self._fill_price(price, "SELL")
-                proceeds, _ = self._sell_proceeds(fill, pos.shares)
-                cash += proceeds
-                pnl = proceeds - pos.cost_basis
-                trades.append(
-                    Trade(
-                        code=code, entry_date=pos.entry_date, exit_date=date_str,
-                        entry_price=pos.entry_price, exit_price=fill, shares=pos.shares,
-                        pnl=round(pnl, 2),
-                        return_pct=pnl / pos.cost_basis if pos.cost_basis > 0 else 0.0,
-                        exit_reason=reason, holding_days=pos.bars_held,
-                    )
-                )
-                del positions[code]
+                cash += self._book_sale(trades, positions, pos, fill, pos.shares,
+                                        date_str, reason)
 
             # --- 3. 收盘：更新持仓、产生明日订单 ---
             equity = cash
@@ -252,18 +271,36 @@ class BacktestEngine:
                 mv = (bar["close"] if bar is not None else pos.entry_price) * pos.shares
                 equity += mv
                 pos.bars_held += 1
+                if bar is not None:
+                    pos.highest_high = max(pos.highest_high, bar["high"])
                 snapshot.append({"code": code, "shares": pos.shares, "market_value": round(mv, 2)})
 
-                # 收盘信号型卖出（自定义规则 / 持有到期）
+                # 收盘信号型卖出（出场规则层 / 自定义 exit_fn / 持有到期）
                 if pos.entry_date == date_str:
                     continue
+                if exit_policy is not None and bar is not None:
+                    ef = prepared[code]["ef"]
+                    # 移动止损在收盘后上移，次日盘中才生效——不能用当日
+                    # 的最高价去判当日是否已被打掉，那是未来函数。
+                    pos.stop_loss, pos.take_profit = exit_policy.levels(ef, bar["i"], pos)
+                    decision = exit_policy.on_close(ef, bar["i"], pos)
+                    if decision is not None:
+                        pos.exit_reason = decision.reason
+                        pos.__dict__["_exit_portion"] = float(decision.portion)
+                        if decision.portion < 1.0:
+                            pos.tier_done = max(pos.tier_done,
+                                                _tier_of(decision.reason))
+                        if code not in pending_exits:
+                            pending_exits.append(code)
+                    continue
+
                 reason = None
                 if exit_fn is not None and bar is not None:
                     reason = exit_fn(prepared[code]["df"], date, pos)
                 if reason is None and pos.bars_held >= self.max_holding_days:
                     reason = f"持有满{self.max_holding_days}日"
                 if reason:
-                    pos.__dict__["_exit_reason"] = reason
+                    pos.exit_reason = reason
                     pending_exits.append(code)
 
             equity_values.append(equity)
@@ -419,6 +456,53 @@ class BacktestEngine:
         if bar["high"] >= pos.take_profit:
             return True, max(open_, pos.take_profit), "止盈"
         return False, 0.0, ""
+
+    @staticmethod
+    def _portion_shares(pos: Position, portion: float) -> int:
+        """按比例算减仓股数，向下取整到 100 股。
+
+        比例算出来不足一手时：若这是清仓指令（portion>=1）就全卖，
+        否则放弃本次减仓——A 股没有零股卖出这回事。剩余不足 200 股时
+        任何减仓都会留下零股，所以直接清掉。
+        """
+        if portion >= 1.0:
+            return pos.shares
+        want = int(pos.shares * portion // 100) * 100
+        if want <= 0:
+            return 0
+        if pos.shares - want < 100:
+            return pos.shares
+        return want
+
+    def _book_sale(self, trades: List[Trade], positions: Dict[str, Position],
+                   pos: Position, price: float, shares: int,
+                   date_str: str, reason: str) -> float:
+        """记一笔卖出，按股数摊销成本，返回到账现金。
+
+        分批止盈要求同一个持仓能卖多次，所以成本必须按比例摊：卖掉一半就
+        转走一半 cost_basis，剩下的留在持仓里。不这么做的话第一笔减仓会
+        背走全部成本，后面几笔看起来全是纯利润。
+        """
+        shares = min(int(shares), pos.shares)
+        if shares <= 0:
+            return 0.0
+        proceeds, _ = self._sell_proceeds(price, shares)
+        cost_part = pos.cost_basis * (shares / pos.shares) if pos.shares else 0.0
+        pnl = proceeds - cost_part
+        trades.append(
+            Trade(
+                code=pos.code, entry_date=pos.entry_date, exit_date=date_str,
+                entry_price=pos.entry_price, exit_price=price, shares=shares,
+                pnl=round(pnl, 2),
+                return_pct=pnl / cost_part if cost_part > 0 else 0.0,
+                exit_reason=reason, holding_days=pos.bars_held,
+            )
+        )
+        pos.shares -= shares
+        pos.cost_basis -= cost_part
+        if pos.shares <= 0:
+            positions.pop(pos.code, None)
+        return proceeds
 
     def _fill_price(self, price: float, side: str) -> float:
         slip = price * self.slippage

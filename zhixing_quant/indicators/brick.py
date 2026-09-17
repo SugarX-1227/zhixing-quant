@@ -18,16 +18,18 @@ def add_brick_indicators(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
         Copy of df with TDX-derived columns.
 
     Rule source:
-        通达信行情指标与选股指标(1).md:
+        通达信行情指标与选股指标(1).md「1-砖型图短期选股」（使用者每日实跑的公式）:
         - 黄线 = (MA(C,14)+MA(C,28)+MA(C,57)+MA(C,114))/4
-        - XG = 昨天绿柱 AND 今天红柱 AND 高度达标 AND 黄线达标
+        - 砖型图 = IF(VAR6A>4, VAR6A-4, 0)
+        - XG = 昨天绿柱 AND 今天红柱 AND 红柱高度>=绿柱高度*2/3 AND 黄线达标
     """
     out = df.copy()
     brick_cfg = cfg["brick"]
     n1 = int(brick_cfg["n1"])
     n2 = int(brick_cfg["n2"])
-    min_height = float(brick_cfg.get("min_brick_height", 4.0))
-    min_growth = float(brick_cfg.get("min_brick_growth", 1.5))
+    min_height_ratio = float(brick_cfg.get("min_height_ratio", 2.0 / 3.0))
+    min_height = float(brick_cfg.get("min_brick_height", 0.0))
+    min_growth = float(brick_cfg.get("min_brick_growth", 0.0))
     close = out["close"]
     high = out["high"]
     low = out["low"]
@@ -43,7 +45,8 @@ def add_brick_indicators(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     var6a = var5a - var2a
     out["brick_value"] = (var6a - 4).clip(lower=0)
 
-    signal_cols = brick_signal_columns(out["brick_value"], min_height, min_growth)
+    signal_cols = brick_signal_columns(out["brick_value"], min_height_ratio,
+                                       min_height, min_growth)
     for col in signal_cols.columns:
         out[col] = signal_cols[col]
     out["sig_brick"] = (
@@ -59,64 +62,89 @@ def add_brick_indicators(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
 
 
 def brick_signal_columns(brick_value: pd.Series,
-                         min_height: float = 4.0,
-                         min_growth: float = 1.5) -> pd.DataFrame:
-    """构造「绿转强红」的判据列。
+                         min_height_ratio: float = 2.0 / 3.0,
+                         min_brick_height: float = 0.0,
+                         min_brick_growth: float = 0.0) -> pd.DataFrame:
+    """构造「绿转强红」的判据列，逐行对应使用者每天在通达信里跑的选股公式。
 
-    ⚠️ 这里曾经踩中战法文档 5.6 专门加粗警告过的那个误读。
+    权威来源（2026-09 由使用者提供，即他每日实跑的那份）::
 
-    原实现：
+        今天红柱 := 砖型图 > REF(砖型图,1);
+        昨天绿柱 := REF(砖型图,1) < REF(砖型图,2);
+        红柱高度 := 砖型图 - REF(砖型图,1);
+        绿柱高度 := REF(砖型图,2) - REF(砖型图,1);
+        高度达标 := 红柱高度 >= 绿柱高度 * 2/3;
+        XG: 昨天绿柱 AND 今天红柱 AND 高度达标 AND 黄线达标;
 
-        red_height   = 砖高 - REF(砖高,1)          # 今日涨幅
-        green_height = REF(砖高,2) - REF(砖高,1)   # 昨日跌幅
-        height_ok    = 今日涨幅 >= 昨日跌幅 * 2/3
+    仓库内 `通达信行情指标与选股指标(1).md` 与 `知行量化系统开发规划.docx`
+    3.6 节（`green_to_strong_red: 红砖覆盖前一根绿砖 2/3 以上`）两份文档
+    与之完全一致。
 
-    这来自课程口语"红柱覆盖前一根绿柱 2/3 以上"。但作者在公式注释里写得
-    很明确：**"今天的红柱高度 > 昨天数值的 1.5 倍（即增长超过 50%），
-    防止微红盘。"** 比较的是砖高本身，不是涨幅比跌幅。
+    ⚠️ 2026-09 之前这里实现的是另一套判据::
 
-    附录 B.5 的原始判据：
+        strong_abs := 砖型图 > 4
+        strong_rel := 砖型图 > REF(砖型图,1) * 1.5
 
-        基础拐点 := REF(AA,1)=0 AND AA=1        （昨天不是红砖，今天是）
-        强度确认 := 砖型图 > 4 AND 砖型图 > REF(砖型图,1) * 1.5
+    出处标的是 `Z哥战法-完整战法详解.md 附录 B.5`，而那份文档**不在本仓库**，
+    与仓库内两份源文档均不符。它错在两处：
 
-    原实现漏掉的两件事：
-    1. `砖高 > 4` 这道**绝对强度**门槛完全没有实现。砖高从 0.1 涨到 0.11
-       也会被判成红砖，正是作者说的"微红盘"。
-    2. `× 1.5` 的比较对象错了。
+    1. **比较对象错了。** 公式比的是「红柱高度 vs 绿柱高度」——两个**增量**；
+       改成了比「砖型图 vs 昨日砖型图」——两个**水平值**。
+    2. **阈值 4 用重了。** `砖型图 := IF(VAR6A>4, VAR6A-4, 0)` 里已经扣过一次 4，
+       再要求 `砖型图 > 4` 等于要求 `VAR6A > 8`。
 
-    实测同一组数据：文档定义命中 0 次，原实现命中 19 次。差的不是精度，
-    是在放行大量贴地的微弱信号——而瑜伽裤战法只有这一个信号。
+    后果实测（50 只 × 2.8 年）：
+
+        现实现（砖高>4 且 >前值×1.5）        1 次信号
+        通达信公式（红柱高度 >= 绿柱高度×2/3）  1553 次信号（≈558 次/年）
+
+    规划书 6.8 验收标准写的是「砖型图战法触发频率约 200-400 次/年」。
+    砖型图在实盘里本该是信号最多的一套战法，旧实现把它压成了哑战法。
+    原因也很直白：砖型图实测常年在 24~154 之间，`> 4` 几乎恒真、不起过滤作用，
+    而 `> 前值 × 1.5` 是要求一条双重平滑的慢速振荡指标单日跳涨 50%，
+    在红柱里只有 0.3% 的日子能满足。
 
     Args:
-        brick_value: 砖高序列。
-        min_height: 绝对强度下限，文档为 4。
-        min_growth: 相对昨日砖高的倍数下限，文档为 1.5。
+        brick_value: 砖高序列（已经是 max(VAR6A-4, 0)）。
+        min_height_ratio: 红柱高度 / 绿柱高度 的下限，通达信公式为 2/3。
+        min_brick_height: **可选**附加门槛，砖高绝对下限。0 = 关闭。
+            不属于通达信公式，留作实验用。
+        min_brick_growth: **可选**附加门槛，砖高相对昨日的倍数下限。0 = 关闭。
 
     Returns:
         含 brick_today_red / brick_yesterday_green / brick_height_ok 等列。
 
     Rule source:
-        Z哥战法-完整战法详解.md 附录 B.5、5.6 节
+        通达信行情指标与选股指标(1).md「1-砖型图短期选股」
+        知行量化系统开发规划.docx 3.6 / 6.8
     """
     prev = ref(brick_value, 1)
-    today_red = brick_value > prev
-    # 基础拐点：昨天不是红砖（绿砖或 0），今天变成红砖
-    yesterday_green = ~ref(today_red, 1).fillna(False).astype(bool)
+    prev2 = ref(brick_value, 2)
 
-    strong_abs = brick_value > min_height
-    strong_rel = brick_value > prev * min_growth
-    height_ok = strong_abs & strong_rel
+    today_red = brick_value > prev
+    # 通达信是严格小于。用 ~ref(today_red,1) 代替会把「昨日持平」也算成绿柱。
+    yesterday_green = prev < prev2
+
+    red_height = brick_value - prev
+    green_height = prev2 - prev
+    height_ok = red_height >= green_height * min_height_ratio
+
+    # 以下两道是可选附加门槛，默认关闭（0），不影响通达信口径
+    strong_abs = (brick_value > min_brick_height if min_brick_height > 0
+                  else pd.Series(True, index=brick_value.index))
+    strong_rel = (brick_value > prev * min_brick_growth if min_brick_growth > 0
+                  else pd.Series(True, index=brick_value.index))
 
     return pd.DataFrame(
         {
             "brick_today_red": today_red.fillna(False),
-            "brick_yesterday_green": yesterday_green,
-            "brick_red_height": brick_value - prev,
+            "brick_yesterday_green": yesterday_green.fillna(False),
+            "brick_red_height": red_height,
+            "brick_green_height": green_height,
             "brick_prev_height": prev,
             "brick_strong_abs": strong_abs.fillna(False),
             "brick_strong_rel": strong_rel.fillna(False),
-            "brick_height_ok": height_ok.fillna(False),
+            "brick_height_ok": (height_ok & strong_abs & strong_rel).fillna(False),
         },
         index=brick_value.index,
     )

@@ -161,8 +161,15 @@ backtest:
   limit_up_chi_next: 0.20    # 创业板
   limit_up_star: 0.20        # 科创板
   max_positions: 5
-  max_holding_days: 20
+  max_holding_days: 20       # 仅在未启用 exits 段时生效，见下方 exits.*.time_stop
   max_entries_per_day: 2
+  # 仓位口径。equal = 剩余现金按空槽等分（旧回测行为，与止损位无关，
+  # 每笔真实风险敞口差异极大）；risk = 走 portfolio.PositionSizer 的
+  # 风险头寸公式，也就是实盘下单计划用的那一套。
+  sizing: risk
+  # 回测里是否套用择时区间的总仓位上限（牛 0.80 / 中性 0.50 / 空 0）。
+  # 此前只有实盘套，回测只做了空头禁开仓，两边口径不一致。
+  apply_regime_cap: true
 
 # ---------------------------------------------------------------------------
 # 出场规则（止损 / 移动止损 / 止盈 / 时间止损）

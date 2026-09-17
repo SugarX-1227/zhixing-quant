@@ -74,3 +74,40 @@ class PositionSizer:
     def risk_exposure(self, shares: int, entry_price: float, stop_loss: float) -> float:
         """这笔单子打到止损会亏多少钱。用于下单前核对。"""
         return max(0.0, (float(entry_price) - float(stop_loss)) * int(shares))
+
+
+def per_position_cap(cfg: dict, equity: float) -> float:
+    """按资金规模选单票市值上限。规格 08.2 分仓数量。
+
+    原来这段是 executor/daily_workflow._per_position_cap，只有实盘走得到；
+    回测那边根本没有单票上限的概念。提到这里让两边共用同一份判据。
+
+    Args:
+        cfg: 配置字典，读 portfolio.per_position_pct。
+        equity: 账户权益。
+
+    Returns:
+        单票市值占权益的上限（0.0-1.0）。
+    """
+    caps = (cfg.get("portfolio", {}) or {}).get("per_position_pct", {}) or {}
+    if equity < 100_000:
+        return float(caps.get("small_capital", 0.50))
+    if equity < 1_000_000:
+        return float(caps.get("medium_expert", 0.20))
+    return float(caps.get("large", 0.07))
+
+
+def regime_cap(cfg: dict, regime: str) -> float:
+    """择时区间对应的总仓位上限。
+
+    这个映射原来有两份：config 的 portfolio.*_max_total，以及
+    timing/strategy_mode.py 里写死的 0.80/0.50/0.0。daily_workflow 用
+    config 那份、把 strategy_mode 的返回值丢掉，回测则两份都没用。
+    现在统一从 config 读。
+    """
+    pcfg = cfg.get("portfolio", {}) or {}
+    return {
+        "BULL": float(pcfg.get("bull_max_total", 0.80)),
+        "NEUTRAL": float(pcfg.get("neutral_max_total", 0.50)),
+        "BEAR": float(pcfg.get("bear_max_total", 0.0)),
+    }.get(str(regime).upper(), float(pcfg.get("neutral_max_total", 0.50)))

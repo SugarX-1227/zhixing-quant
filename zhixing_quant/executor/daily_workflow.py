@@ -341,14 +341,14 @@ def _stage_sizing(cfg: dict, result: DailyResult) -> None:
     if result.candidates is None or result.candidates.empty:
         return
 
-    from zhixing_quant.portfolio.sizer import PositionSizer
+    from zhixing_quant.portfolio.sizer import PositionSizer, per_position_cap
 
     pcfg = cfg.get("portfolio", {})
     sizer = PositionSizer(
         risk_pct=float(pcfg.get("risk_per_trade", 0.02)),
         kelly_fraction=float(pcfg.get("kelly_fraction", 0.25)),
     )
-    per_pos = _per_position_cap(cfg, result.equity)
+    per_pos = per_position_cap(cfg, result.equity)
     equity = result.equity if result.equity > 0 else float(
         cfg.get("capital", {}).get("initial_cash", 0) or 0
     )
@@ -424,16 +424,6 @@ def _enrich(df: pd.DataFrame, cfg: dict):
 
     result = run_pipeline(df, cfg, "defense")
     return result.df, result.warnings(), defense_coverage(result.df)
-
-
-def _per_position_cap(cfg: dict, equity: float) -> float:
-    """按资金规模选单票上限。规格 08.2 分仓数量。"""
-    caps = cfg.get("portfolio", {}).get("per_position_pct", {}) or {}
-    if equity < 100_000:
-        return float(caps.get("small_capital", 0.50))
-    if equity < 1_000_000:
-        return float(caps.get("medium_expert", 0.20))
-    return float(caps.get("large", 0.07))
 
 
 # ---------------------------------------------------------------------------

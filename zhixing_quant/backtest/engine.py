@@ -111,6 +111,15 @@ class BacktestEngine:
         ex = cfg.get("execution", {})
         self.abandon_gap_up = float(ex.get("abandon_gap_up", 0.07))
 
+        # 仓位口径。"equal" 是旧行为（剩余现金按空槽等分），"risk" 走
+        # portfolio/PositionSizer 的风险头寸公式——也就是实盘用的那套。
+        # 代码缺省留 equal 以保证不带配置时行为不变，随仓配置设的是 risk。
+        self.sizing = str(bt.get("sizing", "equal")).lower()
+        pcfg = cfg.get("portfolio", {}) or {}
+        self.risk_per_trade = float(pcfg.get("risk_per_trade", 0.02))
+        self.kelly_fraction = float(pcfg.get("kelly_fraction", 0.25))
+        self.apply_regime_cap = bool(bt.get("apply_regime_cap", False))
+
     # -- 主循环 -----------------------------------------------------------
 
     def run(
@@ -173,6 +182,10 @@ class BacktestEngine:
         daily_positions: List[dict] = []
         pending_entries: List[dict] = []      # T 日收盘产生，T+1 开盘执行
         pending_exits: List[str] = []
+        # 开盘下单时还不知道今天收盘的权益，用昨收的权益和持仓市值做仓位上限的
+        # 分母。这是实盘也只能拿到的信息，不构成未来函数。
+        last_equity = self.initial_capital
+        last_held = 0.0
 
         for day_i, date in enumerate(calendar):
             date_str = date.strftime("%Y-%m-%d")
@@ -221,20 +234,23 @@ class BacktestEngine:
                 if self._is_limit_up_open(prepared, code, date):
                     continue          # 一字涨停买不进
                 price = self._fill_price(bar["open"], "BUY")
-                budget = self._position_budget(cash, positions, price)
-                shares = int(budget // (price * 100)) * 100      # A 股 100 股整手
-                if shares <= 0:
-                    continue
-                cost, _ = self._buy_cost(price, shares)
-                if cost > cash:
-                    continue
-                cash -= cost
+                # 止损要先定下来，风险头寸公式需要它：股数 = 风险预算 ÷ 每股风险
                 if exit_policy is not None:
                     stop, take = exit_policy.initial_levels(
                         prepared[code]["ef"], bar["i"], price)
                 else:
                     raw = order["stop"] if order["stop"] > 0 else bar["low"] * 0.97
                     stop, take = min(raw, price * 0.99), price * (1 + take_profit_pct)
+                shares = self._entry_shares(
+                    cash, positions, price, stop,
+                    equity=last_equity, held_value=last_held,
+                    regime=regime_map.get(date_str, "NEUTRAL"))
+                if shares <= 0:
+                    continue
+                cost, _ = self._buy_cost(price, shares)
+                if cost > cash:
+                    continue
+                cash -= cost
                 positions[code] = Position(
                     code=code,
                     entry_date=date_str,
@@ -304,6 +320,8 @@ class BacktestEngine:
                     pending_exits.append(code)
 
             equity_values.append(equity)
+            last_equity = equity
+            last_held = sum(p["market_value"] for p in snapshot)
             daily_positions.append({"date": date_str, "cash": round(cash, 2),
                                     "equity": round(equity, 2), "positions": snapshot})
 
@@ -526,3 +544,47 @@ class BacktestEngine:
         """等权分配剩余仓位，不超过现金。"""
         slots_left = max(1, self.max_positions - len(positions))
         return min(cash * 0.98, cash / slots_left)
+
+    def _entry_shares(self, cash: float, positions: dict, price: float,
+                      stop: float, equity: float, held_value: float,
+                      regime: str) -> int:
+        """算本笔该买多少股，两种口径。
+
+        equal（旧行为）
+            剩余现金按空槽等分，与止损位无关。止损再宽也买同样的钱，
+            所以每笔的真实风险敞口差异极大。
+
+        risk（实盘口径）
+            走 portfolio.PositionSizer：单笔亏损 ≤ 权益 × risk_per_trade
+            × kelly_fraction，再被单票上限和择时总仓位上限封顶。
+            这是 daily_workflow 下单计划用的同一个公式。
+
+        Args:
+            equity / held_value: 昨收的权益与持仓市值，用作仓位上限的分母。
+            regime: 当日开盘可知的活跃市值区间。
+
+        Returns:
+            股数，100 的整数倍。
+        """
+        if self.sizing != "risk":
+            budget = self._position_budget(cash, positions, price)
+            return int(budget // (price * 100)) * 100
+
+        from zhixing_quant.portfolio.sizer import (PositionSizer, per_position_cap,
+                                                   regime_cap)
+
+        equity = equity if equity > 0 else cash
+        room = 1.0
+        if self.apply_regime_cap:
+            cap = regime_cap(self.cfg, regime)
+            room = max(0.0, cap - (held_value / equity if equity > 0 else 0.0))
+            if room <= 0:
+                return 0
+
+        sizer = PositionSizer(risk_pct=self.risk_per_trade,
+                              kelly_fraction=self.kelly_fraction)
+        shares = sizer.size(price, stop, equity, regime_max_pct=room,
+                            per_position_pct=per_position_cap(self.cfg, equity))
+        # 现金约束：风险头寸算出来再多也不能超过手头的钱
+        affordable = int(cash * 0.98 // (price * 100)) * 100
+        return max(0, min(shares, affordable))

@@ -249,8 +249,13 @@ exits:
     close_below_prev_low: 0.05
 
   b2:
+    # B2 确认阳线入场，买点离黄线远；没有初始止损时，一笔直接下跌的单子
+    # 要一路跌到黄线才走（2026-09 实测 20% 仓位下单笔可亏 10%+，整段回测
+    # -19.7%）。用入场 K 线最低价做灾难兜底，留 5% 缓冲防正常回踩被扫
+    # （无缓冲实测 39 笔里 27 笔被扫出，胜率掉到 20%；缓冲 5% 后只扫 7 笔）。
     stop:
-      kind: none
+      kind: entry_low
+      buffer: 0.05
     trailing:
       kind: white_line
       activate_profit: 0.08

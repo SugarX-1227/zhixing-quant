@@ -28,7 +28,7 @@ from zhixing_quant.ui.theme import (                    # noqa: E402
 inject_css()
 
 BOOKS = {"swing": "波段账户", "scalp": "超短账户"}
-PAGE_ORDER = ["今日", "持仓", "战法", "回测", "个股", "数据"]
+PAGE_ORDER = ["今日", "持仓", "战法", "回测", "因子", "个股", "数据"]
 
 
 @st.cache_resource
@@ -693,7 +693,154 @@ def _draw_kline(df: pd.DataFrame, title: str = "", height: int = 640):
     st.plotly_chart(fig, use_container_width=True)
 
 
+def page_factors(cfg, book):
+    """因子有效性检验。回答的是「这个因子有没有用」，不是「回测能赚多少」。"""
+    import zhixing_quant.factors as FA
+    from zhixing_quant.factors.evaluate import evaluate_factors, monotonicity
+    from zhixing_quant.factors.library import PRESETS
+    from zhixing_quant.data.universe import UniverseSpec
+
+    C.page_head("因子", "战法决定能不能买，因子决定先买哪只")
+
+    all_factors = FA.list_factors()
+    names_all = [f.name for f in all_factors]
+    label_of = {f.name: f"{f.label}（{f.category}）" for f in all_factors}
+
+    c = st.columns([2.6, 1.2, 1.2, 1])
+    picked = c[0].multiselect("参与检验的因子", names_all, default=names_all,
+                              format_func=lambda n: label_of[n])
+    horizon = c[1].number_input("未来收益天数", 1, 60,
+                                int(PS.get_value(cfg, "factors.evaluate.horizon", 5)))
+    quant = c[2].number_input("分层数", 3, 10,
+                              int(PS.get_value(cfg, "factors.evaluate.quantiles", 5)))
+    c[3].write("")
+    c[3].write("")
+    go = c[3].button("开始检验", type="primary", use_container_width=True)
+
+    u = st.columns([1.4, 1.4, 1, 1])
+    start = u[0].date_input("开始", value=datetime.now() - timedelta(days=540),
+                            key="fac_start")
+    end = u[1].date_input("结束", value=datetime.now(), key="fac_end")
+    size = u[2].number_input("股票池大小", 20, 800, 200, 20, key="fac_size")
+    min_amt = u[3].number_input("成交额下限(亿)", 0.0, 50.0, 1.0, 0.5, key="fac_amt")
+
+    st.caption("IC = 当日因子排序与未来 N 日收益排序的秩相关。"
+               "|IC均值| > 0.03 算有信号，|ICIR| > 0.3 算稳定，"
+               "样本不足 60 个交易日的结论不要当真。")
+
+    if go:
+        if not picked:
+            st.warning("至少选一个因子。")
+            return
+        from zhixing_quant.data.tdx_loader import load_daily_many
+        from zhixing_quant.data.universe import build_universe
+        from zhixing_quant.indicators.pipeline import run_steps
+
+        bar = st.progress(0.0, text="建池...")
+        try:
+            spec = UniverseSpec(boards=("MAIN", "CHINEXT"), size=int(size),
+                                min_amount=min_amt * 1e8, exclude_st=True,
+                                min_listed_bars=120)
+            uni = build_universe(cfg, as_of=start.strftime("%Y%m%d"), spec=spec)
+            warm = (pd.Timestamp(start) - timedelta(days=400)).strftime("%Y%m%d")
+            bar.progress(0.2, text=f"加载 {len(uni.codes)} 只行情...")
+            raw = load_daily_many(uni.codes, start_date=warm,
+                                  end_date=end.strftime("%Y%m%d"))
+            steps = FA.required_steps(picked)
+            bar.progress(0.5, text=f"计算指标（{', '.join(steps) or '无'}）...")
+            data = {c2: run_steps(df, cfg, steps).df
+                    for c2, df in raw.items() if df is not None and len(df) > 150}
+            bar.progress(0.8, text="计算 IC 与分层收益...")
+            res = evaluate_factors(data, picked, horizon=int(horizon), q=int(quant),
+                                   start=start.strftime("%Y%m%d"),
+                                   end=end.strftime("%Y%m%d"))
+        except Exception as exc:
+            bar.empty()
+            st.error(f"检验失败：{exc}")
+            return
+        bar.empty()
+        st.session_state["fac"] = (res, len(data))
+
+    got = st.session_state.get("fac")
+    if got is None:
+        C.empty_state("选好因子和区间后点「开始检验」",
+                      "预设权重组合（回踩买点 / 放量突破 / 趋势跟随）给的都是初始"
+                      "猜测值，必须用这一页的 IC 和分层收益校准后再用于选股排序。")
+        with st.expander("已注册的因子"):
+            st.dataframe(pd.DataFrame(
+                [{"因子": f.name, "中文名": f.label, "分类": f.category,
+                  "方向": "越大越好" if f.direction > 0 else "越小越好",
+                  "说明": f.help} for f in all_factors]),
+                use_container_width=True, hide_index=True)
+        with st.expander("预设权重组合"):
+            for key, meta in PRESETS.items():
+                st.markdown(f"**{meta['label']}** (`{key}`) — {meta['help']}")
+                st.caption("、".join(f"{k}×{v}" for k, v in meta["weights"].items()))
+        return
+
+    res, n_loaded = got
+    for w in res["warnings"]:
+        st.warning(w)
+    st.caption(f"实际参与 {n_loaded} 只标的，{len(res['ic'])} 个交易日")
+
+    summary = res["summary"]
+    if summary.empty:
+        C.empty_state("没有算出任何 IC", "多半是区间太短或股票池太小。")
+        return
+
+    C.section("IC 汇总", "按 |ICIR| 降序——稳定性比幅度更值得先看",
+              f"{len(summary)} 个因子")
+    st.dataframe(summary, use_container_width=True, hide_index=True,
+                 column_config={
+                     "IC均值": st.column_config.NumberColumn(format="%.4f"),
+                     "ICIR": st.column_config.NumberColumn(format="%.3f"),
+                     "t值": st.column_config.NumberColumn(format="%.2f"),
+                     "正IC占比": st.column_config.NumberColumn(format="%.1%"),
+                 })
+
+    strong = summary[summary["ICIR"].abs() >= 0.3]
+    if strong.empty:
+        st.info("没有任何因子的 |ICIR| 达到 0.3。要么这批因子在这段行情里无效，"
+                "要么样本太短。别急着拿去配权重。")
+    else:
+        st.success("达到 |ICIR| ≥ 0.3 的因子：" + "、".join(strong["因子"]))
+
+    pick = st.selectbox("看哪个因子的分层收益", list(summary["因子"]),
+                        format_func=lambda n: label_of.get(n, n))
+    qret = res["quantiles"].get(pick)
+    if qret is not None and not qret.empty:
+        mono = monotonicity(qret)
+        left, right = st.columns([5, 5], gap="medium")
+        left.markdown(f"**分层收益**　单调性 {mono:.0%}")
+        left.dataframe(qret, use_container_width=True)
+        if mono < 0.6:
+            left.caption("单调性偏低：只有两头有差异、中间乱，多半是几个极端值"
+                         "造成的假象，不是稳定的方向性。")
+        import plotly.graph_objects as go
+        from zhixing_quant.ui.theme import DOWN, UP
+        vals = qret["平均未来收益"]
+        fig = go.Figure(go.Bar(x=list(vals.index), y=vals.values,
+                               marker_color=[UP if v >= 0 else DOWN for v in vals]))
+        apply_layout(fig, height=260, title=f"{label_of.get(pick, pick)} 分层未来收益")
+        fig.update_layout(yaxis_tickformat=".2%")
+        right.plotly_chart(fig, use_container_width=True)
+
+    ic = res["ic"]
+    if pick in ic.columns:
+        import plotly.graph_objects as go
+        s_ic = ic[pick].dropna()
+        f2 = go.Figure()
+        f2.add_trace(go.Scatter(x=s_ic.index, y=s_ic.cumsum(), name="IC 累计",
+                                line=dict(width=2, color=SIGNAL_LINE)))
+        apply_layout(f2, height=240, title="IC 累计曲线（一路向上才说明稳定有效）")
+        st.plotly_chart(f2, use_container_width=True)
+
+    st.caption(f"覆盖率最低的三个因子：" + "、".join(
+        f"{k} {v:.0%}" for k, v in res["coverage"].head(3).items()))
+
+
 PAGES = {"今日": page_today, "持仓": page_positions, "战法": page_strategies,
+         "因子": page_factors,
          "回测": page_backtest, "个股": page_chart, "数据": page_data}
 
 

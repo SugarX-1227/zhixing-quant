@@ -82,6 +82,7 @@ def scan(
 
     candidates: List[dict] = []
     chart_data: Dict[str, pd.DataFrame] = {}
+    scored_frames: Dict[str, pd.DataFrame] = {}
     errors: Dict[str, str] = {}      # code -> 错误摘要，不再静默吞掉
     short_history = 0
     done = 0
@@ -126,6 +127,8 @@ def scan(
             row["reason"] = spec.reason(latest, cfg)
             candidates.append(row)
             chart_data[code] = enriched.tail(lookback)
+            # 因子打分要完整历史（mom_60_ex5 要 60 根以上），不能用截断过的图表数据
+            scored_frames[code] = enriched
         if progress is not None:
             progress(done, total)
 
@@ -136,19 +139,90 @@ def scan(
         empty.attrs["total_matches"] = 0
         empty.attrs["scanned"] = total
         empty.attrs["warnings"] = diag
+        empty.attrs["rank_note"] = ranking_weights(cfg, spec.key)[1] or "按成交额降序"
         return empty, {}
 
     max_candidates = int(cfg.get("universe", {}).get("max_candidates", 10))
-    df = pd.DataFrame(candidates).sort_values("amount", ascending=False)
+    df = pd.DataFrame(candidates)
+
+    # 排序：有配因子权重就按合成总分，否则退回成交额降序。
+    # 成交额只是流动性代理，和这只票接下来会不会涨没关系——命中 50 只
+    # 只能买 5 只时，按成交额挑等于随机挑。
+    df, rank_note, rank_warn = apply_factor_ranking(
+        df, scored_frames, cfg, spec.key, pd.Timestamp(str(signal_date)))
+    diag.extend(rank_warn)
+
     total_matches = len(df)
     df = df.head(max_candidates).reset_index(drop=True)
     # Keep the uncapped count available to the CLI/UI and self-check output.
     df.attrs["total_matches"] = total_matches
     df.attrs["scanned"] = total
     df.attrs["warnings"] = diag
+    df.attrs["rank_note"] = rank_note
     kept = set(df["code"])
     chart_data = {c: v for c, v in chart_data.items() if c in kept}
     return df, chart_data
+
+
+def ranking_weights(cfg: dict, strategy: str) -> tuple:
+    """取该战法的因子排序权重。
+
+    优先级：`factors.by_strategy.<战法>` > `factors.ranking`（预设名或 custom）。
+    返回 ({因子: 权重}, 说明文案)。没配就返回 ({}, "")，调用方退回成交额排序。
+    """
+    from zhixing_quant.factors.library import PRESETS, preset_weights
+
+    fcfg = (cfg or {}).get("factors", {}) or {}
+    choice = (fcfg.get("by_strategy", {}) or {}).get(strategy) or fcfg.get("ranking")
+    if not choice or choice == "amount":
+        return {}, ""
+    if choice == "custom":
+        w = {k: float(v) for k, v in (fcfg.get("weights", {}) or {}).items()}
+        return w, "自定义因子权重"
+    w = preset_weights(choice)
+    label = PRESETS.get(choice, {}).get("label", choice)
+    return w, f"因子组合「{label}」"
+
+
+def apply_factor_ranking(df: pd.DataFrame, frames: Dict[str, pd.DataFrame],
+                         cfg: dict, strategy: str, date) -> tuple:
+    """按因子合成总分给候选排序。
+
+    Args:
+        df: 候选表，含 code / amount。
+        frames: {code: 带指标的完整日线}，只含命中的候选。
+        cfg: 配置。
+        strategy: 战法名，用于查 factors.by_strategy。
+        date: 信号日。
+
+    Returns:
+        (排序后的 df, 排序口径文案, 告警列表)。
+        任何一步失败都退回成交额降序，绝不让排序把整轮扫描搞崩。
+    """
+    fallback = df.sort_values("amount", ascending=False)
+    weights, label = ranking_weights(cfg, strategy)
+    if not weights:
+        return fallback, "按成交额降序", []
+    try:
+        from zhixing_quant.factors.cross_section import rank_codes
+
+        ranked = rank_codes(frames, df["code"].tolist(), date, weights)
+    except Exception as exc:
+        return fallback, "按成交额降序", [
+            f"因子排序失败，已退回成交额降序：{type(exc).__name__}: {exc}"]
+    if ranked.empty or "score" not in ranked.columns or ranked["score"].isna().all():
+        return fallback, "按成交额降序", [
+            f"{label} 一个因子都没算出有效值（多半是战法流水线不产出所需指标列），"
+            "已退回成交额降序。"]
+
+    merged = df.merge(ranked[["code", "score"]], on="code", how="left")
+    warn = []
+    missing = int(merged["score"].isna().sum())
+    if missing:
+        warn.append(f"{missing} 只候选算不出因子分，排在末尾。")
+    merged = merged.sort_values(["score", "amount"], ascending=[False, False],
+                                na_position="last")
+    return merged, f"{label}（{len(weights)} 个因子加权）", warn
 
 
 def scan_warnings(total: int, short_history: int, errors: Dict[str, str]) -> List[str]:

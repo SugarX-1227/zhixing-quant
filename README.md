@@ -57,7 +57,7 @@ data:
 .venv/bin/streamlit run app.py
 ```
 
-浏览器打开 http://localhost:8501，四个页面：选股 / 回测 / K线 / 数据。
+浏览器打开 http://localhost:8501，七个页面：今日 / 持仓 / 战法 / 回测 / 因子 / 个股 / 数据。
 
 ## 关于复权（重要）
 
@@ -136,6 +136,7 @@ zhixing_quant/
     names.py                股票名称解析
     tdx_loader.py           对上层的统一接口
   indicators/               砖型图 / B1 / B2 / MACD / KDJ ...
+  factors/                  ★ 因子层：注册表 / 因子库 / 横截面打分 / IC 检验
   scanner/                  每日选股扫描器
   backtest/                 回测引擎
   signals/ portfolio/ timing/ strategies/ executor/
@@ -168,6 +169,9 @@ tests/                      pytest
 | `sell` 配置段 | 阈值硬编码在 `sell_s.py` 里，改配置无任何反应 | 已接通 |
 | S1「跌破前低」 | `rolling(5).min()` 含当日，条件恒为假，分支从未触发 | 改看不含当日的前 N 日最低 |
 | 「今日」页复盘历史日期 | 防守阶段不传 `end_date`，用今天的收盘价判过去的止损 | 传入决策日 |
+| 建仓 | 一只标的只建一次仓，规模由风险头寸决定 | 支持「底仓比例 + 分批加仓」（规划书 6.2.1 B1 五步循环） |
+| 候选排序 | 命中后按成交额降序截断 | 可按因子合成总分排序（`factors` 段），成交额仍是兜底 |
+| 因子有效性 | 无 | 「因子」页给 IC / ICIR / 分层收益 / 单调性 |
 
 `zhixing_quant/timing/active_value.py:35` 还有一句提到 TDX MCP 的注释，只是注释，不影响运行。
 

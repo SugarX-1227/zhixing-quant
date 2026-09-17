@@ -139,7 +139,10 @@ def run_daily_cycle(
     # ---------- 阶段 2：防守（先处理持仓）----------
     positions = store.positions(book)
     prices = dict(zip(spot["code"], spot["close"]))
-    _stage_defense(cfg, store, positions, result)
+    # 决策日取快照的真实交易日，而不是用户输入的原始字符串——用户可能选了
+    # 一个非交易日，fetch_a_spot 已经落到上一交易日了。
+    _stage_defense(cfg, store, positions, result,
+                   as_of=trade_date.strftime("%Y%m%d"))
 
     result.cash = store.cash(book)
     result.equity = store.equity(prices, book)
@@ -217,8 +220,17 @@ def _stage_timing(cfg: dict, spot: pd.DataFrame, result: DailyResult) -> None:
     )
 
 
-def _stage_defense(cfg: dict, store, positions: List[dict], result: DailyResult) -> None:
-    """对每个持仓跑防守阶梯 + 五分制评级。"""
+def _stage_defense(cfg: dict, store, positions: List[dict], result: DailyResult,
+                   as_of: Optional[str] = None) -> None:
+    """对每个持仓跑防守阶梯 + 五分制评级。
+
+    Args:
+        as_of: YYYYMMDD 决策日。**必须传**：原实现调 `load_daily(code)` 不带
+            end_date，永远拿库里最新一根 K 线。于是在「今日」页选一个历史日期
+            复盘时，择时和选股都按那天算，唯独防守引擎在用今天的收盘价判
+            止损、判跌破黄线——一个标准的未来函数，而且只在复盘时发作，
+            界面上没有任何痕迹。
+    """
     if not positions:
         return
 
@@ -233,7 +245,7 @@ def _stage_defense(cfg: dict, store, positions: List[dict], result: DailyResult)
     for pos in positions:
         code = pos["code"]
         try:
-            df = load_daily(code, adjust="qfq")
+            df = load_daily(code, end_date=as_of, adjust="qfq")
             if df.empty or len(df) < 120:
                 result.notes.append(f"{code} K线不足 120 根，跳过防守评估。")
                 continue
@@ -309,6 +321,7 @@ def _stage_offense(cfg, result, strategy_key, date, limit_universe, progress,
         return
 
     result.charts = charts
+    result.notes.extend(candidates.attrs.get("warnings", []))
     if candidates.empty:
         return
 

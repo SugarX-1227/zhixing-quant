@@ -71,7 +71,12 @@ def compute_metrics(
     win_rate = len(wins) / total_trades if total_trades > 0 else 0.0
     avg_win = sum(t["return_pct"] for t in wins) / len(wins) if wins else 0.0
     avg_loss = abs(sum(t["return_pct"] for t in losses) / len(losses)) if losses else 0.0
-    pl_ratio = avg_win / avg_loss if avg_loss > 0 else float("inf") if avg_win > 0 else 0.0
+    # 没有亏损交易时盈亏比在数学上是无穷大。这里不返回 float("inf")，
+    # 因为界面会把它直接塞进 f"{v:.2f}"；早先返回字符串 "inf" 更糟——
+    # str 碰上 .2f 格式符直接 ValueError，整个回测页白屏。
+    # 统一返回有限浮点，另用 profit_loss_ratio_is_inf 标明真实情况。
+    pl_is_inf = avg_loss <= 0 and avg_win > 0
+    pl_ratio = avg_win / avg_loss if avg_loss > 0 else 0.0
 
     return {
         "annualized_return": round(annual_return, 4),
@@ -80,7 +85,8 @@ def compute_metrics(
         "sortino": round(sortino, 4),
         "calmar": round(calmar, 4),
         "win_rate": round(win_rate, 4),
-        "profit_loss_ratio": round(pl_ratio, 4) if pl_ratio != float("inf") else "inf",
+        "profit_loss_ratio": round(pl_ratio, 4),
+        "profit_loss_ratio_is_inf": pl_is_inf,
         "total_trades": total_trades,
     }
 
@@ -94,5 +100,6 @@ def _empty_metrics() -> dict:
         "calmar": 0.0,
         "win_rate": 0.0,
         "profit_loss_ratio": 0.0,
+        "profit_loss_ratio_is_inf": False,
         "total_trades": 0,
     }

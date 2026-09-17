@@ -100,8 +100,12 @@ single_needle:
   n1: 10
   n2: 20
 
+# S 系列卖点。2026-09 之前这一整段是死配置——signals/sell_s.py 把
+# 2.0 / 0.6 / 0.02 硬编码在函数体里，改这里不会有任何反应。现已接通。
 sell:
   s1_double_vol_threshold: 2.0
+  s1_break_low_window: 5          # 跌破前 N 日最低（不含当日）
+  s1_break_low_needs_volume: false  # 跌破前低是否也要求放量确认
   s2_white_break: true
   s3_big_bear_body_min: 0.6
   s3_gap_down_pct: 0.02

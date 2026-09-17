@@ -402,11 +402,22 @@ class BacktestEngine:
 
     @staticmethod
     def _intraday_exit(bar: dict, pos: Position) -> tuple:
-        """盘中止损优先于止盈（同一根 K 线无法判断先后，保守取最坏情况）。"""
+        """盘中止损优先于止盈（同一根 K 线无法判断先后，保守取最坏情况）。
+
+        成交价必须考虑**跳空穿越**：止损单挂在 9.50，如果次日直接低开到 8.00，
+        实盘只能在 8.00 附近成交，不可能在 9.50 成交。原实现无条件按触发价
+        记账，等于假设每一次跳空都能在缺口上沿接住，会系统性高估收益——
+        而且跳得越狠、虚增越多，恰好在最该扣分的那几笔上给了加分。
+
+        止盈同理取较保守的一侧：跳空高开越过止盈价时按开盘价成交（对回测
+        是利好，但这就是实盘会发生的事），否则按止盈价。
+        """
+        open_ = bar["open"]
         if bar["low"] <= pos.stop_loss:
-            return True, pos.stop_loss, "止损"
+            # 开盘已在止损价之下 = 跳空穿越，只能按开盘价出
+            return True, min(open_, pos.stop_loss), "止损"
         if bar["high"] >= pos.take_profit:
-            return True, pos.take_profit, "止盈"
+            return True, max(open_, pos.take_profit), "止盈"
         return False, 0.0, ""
 
     def _fill_price(self, price: float, side: str) -> float:

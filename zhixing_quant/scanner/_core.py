@@ -82,6 +82,8 @@ def scan(
 
     candidates: List[dict] = []
     chart_data: Dict[str, pd.DataFrame] = {}
+    errors: Dict[str, str] = {}      # code -> 错误摘要，不再静默吞掉
+    short_history = 0
     done = 0
 
     # 分批取，避免一次把整个市场的 DataFrame 都留在内存里
@@ -93,13 +95,18 @@ def scan(
             done += 1
             df = frames.get(code)
             if df is None or len(df) < min_bars:
+                short_history += 1
                 continue
             try:
                 enriched = spec.add_indicators(df, cfg)
-            except Exception:
-                # 单只股票算指标失败不该中断整轮扫描
+            except Exception as exc:
+                # 单只股票算指标失败不该中断整轮扫描，但也不能当没发生：
+                # 原实现直接 continue，于是「今天没有命中」和「整个池子
+                # 全都算崩了」在界面上长得一模一样。现在记下来往外抛。
+                errors[code] = f"{type(exc).__name__}: {exc}"
                 continue
             if spec.signal_col not in enriched.columns:
+                errors[code] = f"指标未产出信号列 {spec.signal_col}"
                 continue
             latest = enriched.iloc[-1]
             if not bool(latest[spec.signal_col]):
@@ -122,8 +129,14 @@ def scan(
         if progress is not None:
             progress(done, total)
 
+    diag = scan_warnings(total, short_history, errors)
+
     if not candidates:
-        return _empty_candidates(), {}
+        empty = _empty_candidates()
+        empty.attrs["total_matches"] = 0
+        empty.attrs["scanned"] = total
+        empty.attrs["warnings"] = diag
+        return empty, {}
 
     max_candidates = int(cfg.get("universe", {}).get("max_candidates", 10))
     df = pd.DataFrame(candidates).sort_values("amount", ascending=False)
@@ -131,13 +144,49 @@ def scan(
     df = df.head(max_candidates).reset_index(drop=True)
     # Keep the uncapped count available to the CLI/UI and self-check output.
     df.attrs["total_matches"] = total_matches
+    df.attrs["scanned"] = total
+    df.attrs["warnings"] = diag
     kept = set(df["code"])
     chart_data = {c: v for c, v in chart_data.items() if c in kept}
     return df, chart_data
 
 
+def scan_warnings(total: int, short_history: int, errors: Dict[str, str]) -> List[str]:
+    """把扫描过程中被跳过的标的归并成人能读的告警。
+
+    抽成纯函数是为了能单测。判据：跳过的比例高到足以让"没命中"变成
+    "没扫成"时必须说出来。回测执行器已经这么做了，扫描器原来没有。
+
+    Args:
+        total: 池内标的总数。
+        short_history: 因 K 线不足被跳过的数量。
+        errors: code -> 错误摘要。
+
+    Returns:
+        告警文案列表，一切正常时为空。
+    """
+    out: List[str] = []
+    if errors:
+        kinds: Dict[str, int] = {}
+        for msg in errors.values():
+            kinds[msg] = kinds.get(msg, 0) + 1
+        top = sorted(kinds.items(), key=lambda kv: -kv[1])[:3]
+        detail = "；".join(f"{msg}（{n} 只）" for msg, n in top)
+        out.append(f"{len(errors)} 只标的指标计算失败，已跳过：{detail}")
+    if total and short_history / total >= 0.5:
+        out.append(
+            f"池内 {total} 只里有 {short_history} 只 K 线不足，没参与计算。"
+            "多半是行情库还没补齐历史，此时「没有命中」不代表真的没有信号。"
+        )
+    if total and (short_history + len(errors)) >= total:
+        out.append("没有任何一只标的被实际计算过，本次扫描结果无意义。")
+    return out
+
+
 def print_candidates(spec: StrategySpec, candidates: pd.DataFrame) -> None:
     """命令行输出。取代原来的 HTML 报告，结果直接看终端或 Web 界面。"""
+    for w in candidates.attrs.get("warnings", []):
+        print(f"⚠ {w}")
     if candidates.empty:
         print(f"{spec.label}：当日无符合条件的标的。")
         return

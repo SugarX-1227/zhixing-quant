@@ -225,6 +225,10 @@ def page_strategies(cfg, book):
 
     sname, cands, charts, scanned = got
     meta = strategies.get(sname, {})
+    # 扫描过程中被跳过的标的（K线不足 / 指标报错）必须说出来，
+    # 否则「没命中」和「根本没算成」在界面上无法区分。
+    for w in cands.attrs.get("warnings", []):
+        st.warning(w)
     rate = len(cands) / max(scanned, 1)
     C.section(meta.get("label", sname),
               f"规格 {meta.get('spec','')} · 扫描 {scanned} 只",
@@ -385,8 +389,10 @@ def page_backtest(cfg, book):
                  "up" if m.get("annualized_return", 0) >= 0 else "down"),
                 ("最大回撤", f"{m.get('max_drawdown',0):.2%}", ""),
                 ("夏普", f"{m.get('sharpe',0):.2f}", "")])
+    pl = "∞（本段没有亏损交易）" if m.get("profit_loss_ratio_is_inf") \
+        else f"{m.get('profit_loss_ratio', 0):.2f}"
     C.stat_row([("胜率", f"{m.get('win_rate',0):.1%}", ""),
-                ("盈亏比", f"{m.get('profit_loss_ratio',0):.2f}", ""),
+                ("盈亏比", pl, ""),
                 ("交易笔数", m.get("total_trades", 0), ""),
                 ("超额收益" if ex is not None else "期末权益",
                  f"{ex:.2%}" if ex is not None else f"{m.get('final_equity',0):,.0f}",

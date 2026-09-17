@@ -112,9 +112,10 @@ class BacktestEngine:
         self.abandon_gap_up = float(ex.get("abandon_gap_up", 0.07))
 
         # 仓位口径。"equal" 是旧行为（剩余现金按空槽等分），"risk" 走
-        # portfolio/PositionSizer 的风险头寸公式——也就是实盘用的那套。
-        # 代码缺省留 equal 以保证不带配置时行为不变，随仓配置设的是 risk。
+        # portfolio/PositionSizer 的风险头寸公式，"pct" 每笔固定权益比例。
+        # 代码缺省留 equal 以保证不带配置时行为不变，随仓配置设的是 pct。
         self.sizing = str(bt.get("sizing", "equal")).lower()
+        self.position_pct = float(bt.get("position_pct", 0.20))
         pcfg = cfg.get("portfolio", {}) or {}
         self.risk_per_trade = float(pcfg.get("risk_per_trade", 0.02))
         self.kelly_fraction = float(pcfg.get("kelly_fraction", 0.25))
@@ -305,7 +306,7 @@ class BacktestEngine:
                         pos.__dict__["_exit_portion"] = float(decision.portion)
                         if decision.portion < 1.0:
                             pos.tier_done = max(pos.tier_done,
-                                                _tier_of(decision.reason))
+                                                decision.tier or _tier_of(decision.reason))
                         if code not in pending_exits:
                             pending_exits.append(code)
                     continue
@@ -548,11 +549,15 @@ class BacktestEngine:
     def _entry_shares(self, cash: float, positions: dict, price: float,
                       stop: float, equity: float, held_value: float,
                       regime: str) -> int:
-        """算本笔该买多少股，两种口径。
+        """算本笔该买多少股，三种口径。
 
         equal（旧行为）
             剩余现金按空槽等分，与止损位无关。止损再宽也买同样的钱，
             所以每笔的真实风险敞口差异极大。
+
+        pct（固定比例）
+            每笔目标市值 = 权益 × position_pct（默认 20%），仍被择时总仓位
+            上限和现金封顶。想要「单笔 20%、多头不满仓闲置」就用这个。
 
         risk（实盘口径）
             走 portfolio.PositionSizer：单笔亏损 ≤ 权益 × risk_per_trade
@@ -566,6 +571,19 @@ class BacktestEngine:
         Returns:
             股数，100 的整数倍。
         """
+        if self.sizing == "pct":
+            from zhixing_quant.portfolio.sizer import regime_cap
+
+            eq = equity if equity > 0 else cash
+            budget = eq * self.position_pct
+            if self.apply_regime_cap:
+                cap = regime_cap(self.cfg, regime)
+                room = max(0.0, cap - (held_value / eq if eq > 0 else 0.0))
+                budget = min(budget, eq * room)
+            affordable = int(cash * 0.98 // (price * 100)) * 100
+            want = int(budget // (price * 100)) * 100
+            return max(0, min(want, affordable))
+
         if self.sizing != "risk":
             budget = self._position_budget(cash, positions, price)
             return int(budget // (price * 100)) * 100

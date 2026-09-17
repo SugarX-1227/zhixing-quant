@@ -121,8 +121,9 @@ def test_trailing_waits_for_the_activation_profit():
 def test_trailing_yellow_line_tracks_the_indicator():
     f = _frame([(10, 10.5, 9.9, 10.3)] * 5, yellow=[9.5, 9.6, 9.7, 9.8, 9.9])
     p = ExitPolicy(ExitSpec(trail=TrailSpec(kind="yellow_line")))
+    # 线是当日收盘算的，当日盘中止损只能用昨日值（9.8），否则是未来函数
     stop, _ = p.levels(f, 4, _pos(stop=9.0))
-    assert stop == pytest.approx(9.9)
+    assert stop == pytest.approx(9.8)
 
 
 def test_trailing_chandelier_uses_high_minus_atr():
@@ -455,3 +456,109 @@ def test_engine_without_policy_keeps_legacy_behaviour():
     frame = res.trades_frame()
     assert len(frame) == 1
     assert frame.iloc[0]["exit_reason"] == "持有满5日"
+
+
+# ---------------------------------------------------------------------------
+# 涨幅分批止盈 / 白线移动止损 / 盈转亏 / 低低走人（B1/B2 新口径）
+# ---------------------------------------------------------------------------
+
+def _pt_spec(**kw):
+    from zhixing_quant.backtest.exits import ExitSpec, StopSpec, TakeProfitSpec, TimeStopSpec
+    return ExitSpec(
+        stop=StopSpec(kind="none"),
+        take_profit=TakeProfitSpec(kind="price_tiers",
+                                   price_tiers=((0.08, 1/3), (0.20, 1/3))),
+        time_stop=TimeStopSpec(max_holding_days=0),
+        **kw,
+    )
+
+
+def test_price_tier_first_fires_at_8pct():
+    f = _frame([(10, 10.2, 9.9, 10.0), (10, 11.0, 10.0, 10.9)])   # +9%
+    d = ExitPolicy(_pt_spec()).on_close(f, 1, _pos(entry=10.0, high=11.0))
+    assert d is not None and d.portion == pytest.approx(1/3)
+    assert d.tier == 1
+
+
+def test_price_tier_second_fires_at_20pct_and_not_before():
+    pol = ExitPolicy(_pt_spec())
+    f = _frame([(10, 10.2, 9.9, 10.0), (10, 12.1, 10.0, 12.0)])    # +20%
+    pos = _pos(entry=10.0, high=12.1)
+    pos.tier_done = 1
+    d = pol.on_close(f, 1, pos)
+    assert d is not None and d.tier == 2
+
+
+def test_price_tier_done_tiers_do_not_refire():
+    pol = ExitPolicy(_pt_spec())
+    f = _frame([(10, 10.2, 9.9, 10.0), (10, 11.0, 10.0, 10.9)] * 2)
+    pos = _pos(entry=10.0, high=11.0)
+    pos.tier_done = 1
+    assert pol.on_close(f, 3, pos) is None
+
+
+def test_price_tier_between_thresholds_is_quiet():
+    f = _frame([(10, 10.2, 9.9, 10.0), (10, 10.5, 10.0, 10.4)])    # +4%
+    assert ExitPolicy(_pt_spec()).on_close(f, 1, _pos(entry=10.0, high=10.5)) is None
+
+
+def test_profit_to_loss_exits_only_after_real_profit():
+    spec = _pt_spec(profit_to_loss=0.02)
+    pol = ExitPolicy(spec)
+    f = _frame([(10, 10.2, 9.9, 10.0), (10, 10.3, 9.6, 9.7)])      # 收盘跌破成本
+    # 曾有 +3% 浮盈（high=10.3）→ 盈转亏成立
+    d = pol.on_close(f, 1, _pos(entry=10.0, high=10.3))
+    assert d is not None and d.reason == "盈转亏清仓"
+    # 若从未明显盈利（high 只到 10.1）→ 不触发
+    d2 = pol.on_close(f, 1, _pos(entry=10.0, high=10.1))
+    assert d2 is None
+
+
+def test_close_below_prev_low_after_runup():
+    spec = _pt_spec(close_below_prev_low=0.05)
+    pol = ExitPolicy(spec)
+    # 昨天 low=11.0，今天收盘 10.8 < 11.0，且曾有 +6% 浮盈
+    f = _frame([(10, 10.2, 9.9, 10.0), (11.2, 11.5, 11.0, 11.3),
+                (10.9, 11.0, 10.7, 10.8)])
+    d = pol.on_close(f, 2, _pos(entry=10.0, high=11.5))
+    assert d is not None and d.reason == "高位收盘破前低"
+    # 浮盈没到 5% 的普通回落不触发
+    f2 = _frame([(10, 10.2, 9.9, 10.0), (10.1, 10.3, 10.0, 10.2),
+                 (9.9, 10.0, 9.7, 9.8)])
+    assert pol.on_close(f2, 2, _pos(entry=10.0, high=10.3)) is None
+
+
+def test_trailing_white_line_uses_yesterday_value():
+    """白线/黄线是当日收盘算的，做当日盘中止损必须用昨日值（无未来函数）。"""
+    spec = _pt_spec(trail=TrailSpec(kind="white_line", activate_profit=0.0))
+    pol = ExitPolicy(spec)
+    f = _frame([(10, 10.2, 9.9, 10.0), (10, 11.0, 10.0, 10.9), (10, 11.0, 10.0, 10.9)])
+    f.white_line = np.array([9.0, 9.5, 10.4])
+    pos = _pos(entry=10.0, stop=0.0, tp=float("inf"), high=11.0)
+    # 第3天：昨日白线 9.5 → 止损抬到 9.5；当日白线 10.4 不得泄露进来
+    stop, _ = pol.levels(f, 2, pos)
+    assert stop == pytest.approx(9.5)
+
+
+def test_trailing_white_line_waits_for_activation():
+    spec = _pt_spec(trail=TrailSpec(kind="white_line", activate_profit=0.08))
+    pol = ExitPolicy(spec)
+    f = _frame([(10, 10.2, 9.9, 10.0), (10, 10.3, 10.0, 10.2)])    # 只涨 2%
+    f.white_line = np.array([9.0, 9.95])
+    pos = _pos(entry=10.0, stop=0.0, tp=float("inf"), high=10.3)
+    stop, _ = pol.levels(f, 1, pos)
+    assert stop == 0.0        # 未达 +8% 不启用
+
+
+def test_price_tiers_parse_from_config():
+    cfg = {"exits": {"b1": {
+        "take_profit": {"kind": "price_tiers",
+                        "price_tiers": [{"gain": 0.08, "sell": 0.33},
+                                         {"gain": 0.20, "sell": 0.33}]},
+        "profit_to_loss": 0.02,
+        "close_below_prev_low": 0.05,
+    }}}
+    s = spec_from_config(cfg, "b1")
+    assert s.take_profit.price_tiers == ((0.08, 0.33), (0.20, 0.33))
+    assert s.profit_to_loss == pytest.approx(0.02)
+    assert s.close_below_prev_low == pytest.approx(0.05)

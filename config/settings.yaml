@@ -137,7 +137,7 @@ timing:
 portfolio:
   risk_per_trade: 0.02
   kelly_fraction: 0.25
-  bull_max_total: 0.80
+  bull_max_total: 1.0     # 多头区间满仓可用（单笔 20% × 5 槽）
   neutral_max_total: 0.50
   bear_max_total: 0.0
   per_position_pct:
@@ -165,9 +165,11 @@ backtest:
   max_entries_per_day: 2
   # 仓位口径。equal = 剩余现金按空槽等分（旧回测行为，与止损位无关，
   # 每笔真实风险敞口差异极大）；risk = 走 portfolio.PositionSizer 的
-  # 风险头寸公式，也就是实盘下单计划用的那一套。
-  sizing: risk
-  # 回测里是否套用择时区间的总仓位上限（牛 0.80 / 中性 0.50 / 空 0）。
+  # 风险头寸公式（仓位随止损距离变化，通常很小）；pct = 每笔固定
+  # 权益比例（position_pct），被择时总仓位上限封顶。
+  sizing: pct
+  position_pct: 0.20        # 单笔目标市值 = 权益 × 20%
+  # 回测里是否套用择时区间的总仓位上限（牛 1.0 / 中性 0.50 / 空 0）。
   # 此前只有实盘套，回测只做了空头禁开仓，两边口径不一致。
   apply_regime_cap: true
 
@@ -222,36 +224,46 @@ exits:
       max_holding_days: 6
     break_yellow_line: true
 
-  # B1 是阶段性低点，止损天然取信号日最低价，但那条线离成本太近——
-  # 实测 362 笔里 285 笔止损、中位持有 1 天。这里放宽到 ATR 止损 + 吊灯移动止损。
+  # B1/B2 出场体系（2026-09 使用者定的口径）：
+  #   分批止盈：涨 8% 卖 1/3，涨 20% 再卖 1/3，剩余跌破白线全走（白线移动
+  #             止损在浮盈 8% 后启用——前两档止盈落袋后兜底离场）
+  #   单次止损（收盘确认，次日开盘清仓）：跌破黄线 / 盈转亏（浮盈曾超 2%
+  #             后收盘跌回成本）/ 低低走人（浮盈曾超 5% 后收盘 < 前一日最低）
+  #   多头转空头由择时闸门处理（引擎在空头日开盘强制清仓），不在此配置。
+  #   不设初始价位止损、不限最长持有天数。
   b1:
     stop:
-      kind: atr
-      atr_mult: 2.0
-    trailing:
-      kind: chandelier
-      atr_mult: 3.0
-      activate_profit: 0.05
-    take_profit:
       kind: none
+    trailing:
+      kind: white_line
+      activate_profit: 0.08
+    take_profit:
+      kind: price_tiers
+      price_tiers:
+        - {gain: 0.08, sell: 0.33}
+        - {gain: 0.20, sell: 0.33}
     time_stop:
-      max_holding_days: 30
+      max_holding_days: 0
     break_yellow_line: true
+    profit_to_loss: 0.02
+    close_below_prev_low: 0.05
 
   b2:
     stop:
-      kind: atr
-      atr_mult: 2.5
+      kind: none
     trailing:
-      kind: pct
-      pct: 0.12
+      kind: white_line
       activate_profit: 0.08
     take_profit:
-      kind: pct
-      pct: 0.20
+      kind: price_tiers
+      price_tiers:
+        - {gain: 0.08, sell: 0.33}
+        - {gain: 0.20, sell: 0.33}
     time_stop:
-      max_holding_days: 20
+      max_holding_days: 0
     break_yellow_line: true
+    profit_to_loss: 0.02
+    close_below_prev_low: 0.05
 
 strategies:
   brick:

@@ -86,6 +86,7 @@ class TrailSpec:
         pct          持仓期间最高价 × (1 - pct)
         chandelier   持仓期间最高价 - atr_mult × ATR（吊灯止损）
         yellow_line  知行多空线（黄线随价格上移，天然是移动止损）
+        white_line   白线（比黄线快，分批止盈后剩余仓位的兜底离场）
     """
     kind: str = "none"
     pct: float = 0.10
@@ -99,14 +100,18 @@ class TakeProfitSpec:
     """止盈。
 
     kind:
-        none        不设固定止盈，靠移动止损和收盘型规则了结
-        pct         入场价 × (1 + pct)
-        tiered      按 red_streak（连续红砖根数）分批了结，见 tiers
+        none         不设固定止盈，靠移动止损和收盘型规则了结
+        pct          入场价 × (1 + pct)
+        tiered       按 red_streak（连续红砖根数）分批了结，见 tiers
+        price_tiers  按涨幅分批了结（涨 8% 减 1/3、涨 20% 再减 1/3，
+                     剩余交给移动止损），见 price_tiers
     """
     kind: str = "pct"
     pct: float = 0.15
     # {连续红砖根数: 减仓比例}。规划书 6.4.2 四块砖止盈定律。
     tiers: Dict[int, float] = field(default_factory=dict)
+    # [(涨幅门槛, 减仓比例), ...] 按涨幅升序，如 [(0.08, 1/3), (0.20, 1/3)]。
+    price_tiers: Tuple[Tuple[float, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -127,16 +132,27 @@ class ExitSpec:
     defense_ladder: bool = False    # 启用 portfolio/defense.py 八级阶梯
     strategy_exit: bool = False     # 调用战法自身 exit_conditions
     break_yellow_line: bool = False  # 收盘跌破黄线即清仓（规格 01.3 [LOCKED]）
+    # 盈转亏：浮盈曾超过此比例后，某天收盘跌回成本下方 → 当日清仓。0 = 关闭
+    profit_to_loss: float = 0.0
+    # 低低走人：浮盈曾超过此比例后，某天收盘 < 前一日最低价 → 当日清仓。0 = 关闭
+    close_below_prev_low: float = 0.0
 
     def describe(self) -> str:
         parts = [f"止损={self.stop.kind}"]
         if self.trail.kind != "none":
             parts.append(f"移动止损={self.trail.kind}")
         parts.append(f"止盈={self.take_profit.kind}")
+        if self.take_profit.kind == "price_tiers":
+            tiers = "、".join(f"+{g:.0%}减{p:.0%}" for g, p in self.take_profit.price_tiers)
+            parts.append(f"分批止盈[{tiers}]")
         if self.time_stop.max_holding_days:
             parts.append(f"最长持有{self.time_stop.max_holding_days}日")
         if self.break_yellow_line:
             parts.append("破黄线清仓")
+        if self.profit_to_loss:
+            parts.append(f"盈转亏清仓(浮盈>{self.profit_to_loss:.0%}后)")
+        if self.close_below_prev_low:
+            parts.append(f"低低走人(浮盈>{self.close_below_prev_low:.0%}后)")
         if self.defense_ladder:
             parts.append("防守阶梯")
         if self.strategy_exit:
@@ -150,10 +166,15 @@ class ExitSpec:
 
 @dataclass
 class ExitDecision:
-    """一条收盘型出场指令。portion < 1 表示减仓而非清仓。"""
+    """一条收盘型出场指令。portion < 1 表示减仓而非清仓。
+
+    tier 是分批止盈已执行到的档位（1 起数），引擎记进 Position.tier_done，
+    避免同一档反复触发；红砖档位仍从 reason 里解析（兼容旧配置）。
+    """
     reason: str
     portion: float = 1.0
     priority: int = 99
+    tier: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -230,11 +251,16 @@ class ExitPolicy:
         elif t.kind == "chandelier":
             a = frame.atr(t.atr_window)[i]
             cand = pos.highest_high - t.atr_mult * a if np.isfinite(a) else -INF
-        elif t.kind == "yellow_line":
-            y = frame.yellow_line[i]
-            cand = y if np.isfinite(y) else -INF
         else:
-            cand = -INF
+            # 线型移动止损取**昨日**的线值：线是用当日收盘算的，
+            # 拿当日线做当日盘中止损是未来函数。
+            if t.kind == "yellow_line":
+                line = frame.yellow_line[i - 1] if i > 0 else np.nan
+            elif t.kind == "white_line":
+                line = frame.white_line[i - 1] if i > 0 else np.nan
+            else:
+                line = np.nan
+            cand = line if np.isfinite(line) else -INF
 
         if np.isfinite(cand) and cand > stop:
             stop = float(cand)
@@ -259,6 +285,27 @@ class ExitPolicy:
                             reason=f"连{k}根红砖减仓", portion=float(tiers[k]),
                             priority=1))
 
+        # P1' 涨幅分批止盈（+8% 减 1/3、+20% 再减 1/3）。收盘确认，次日开盘成交。
+        ptiers = self.spec.take_profit.price_tiers
+        if self.spec.take_profit.kind == "price_tiers" and ptiers:
+            gain = frame.close[i] / pos.entry_price - 1.0
+            _EPS = 1e-9      # 12/10-1 在浮点里是 0.19999...，恰好达标不能漏
+            for tier_idx, (gain_th, portion) in enumerate(ptiers, start=1):
+                if gain >= gain_th - _EPS and tier_idx > pos.tier_done:
+                    # 找未执行的**最高**档（跳档：直接从 +8% 涨到 +21% 时两档
+                    # 不会同日都触发，按高档执行，低档视为已过）
+                    best = max(
+                        (t for t, (g, _p) in enumerate(ptiers, start=1)
+                         if gain >= g - _EPS and t > pos.tier_done),
+                        default=None,
+                    )
+                    if best is not None:
+                        g, p = ptiers[best - 1]
+                        hits.append(ExitDecision(
+                            reason=f"涨{g:.0%}减仓{p:.0%}",
+                            portion=float(p), priority=5, tier=best))
+                    break
+
         # P3-P8 防守阶梯
         if self.spec.defense_ladder and self.defense is not None:
             sig = self.defense.evaluate_row(frame.row(i), pos.as_dict())
@@ -271,6 +318,19 @@ class ExitPolicy:
             y = frame.yellow_line[i]
             if np.isfinite(y) and frame.close[i] < y:
                 hits.append(ExitDecision(reason="跌破知行多空线", priority=7))
+
+        # 盈转亏：浮盈曾达标，现在收盘跌回成本下方 → 清仓
+        if self.spec.profit_to_loss > 0:
+            peaked = pos.highest_high >= pos.entry_price * (1.0 + self.spec.profit_to_loss)
+            if peaked and frame.close[i] < pos.entry_price:
+                hits.append(ExitDecision(reason="盈转亏清仓", priority=3))
+
+        # 低低走人：浮盈曾达标，今天收盘 < 昨天最低价 → 清仓
+        if self.spec.close_below_prev_low > 0 and i > 0:
+            peaked = pos.highest_high >= pos.entry_price * (1.0 + self.spec.close_below_prev_low)
+            prev_low = frame.low[i - 1]
+            if peaked and np.isfinite(prev_low) and frame.close[i] < prev_low:
+                hits.append(ExitDecision(reason="高位收盘破前低", priority=3))
 
         # 战法自身出场
         if self.spec.strategy_exit and self.strategy is not None:
@@ -387,6 +447,21 @@ def spec_from_config(cfg: dict, strategy: Optional[str] = None) -> ExitSpec:
         except (TypeError, ValueError):
             continue
 
+    # 涨幅分批止盈：支持 [{gain: 0.08, sell: 0.33}, ...] 和 [[0.08, 0.33], ...]
+    price_tiers: list = []
+    for item in (tp.get("price_tiers", []) or []):
+        if isinstance(item, dict):
+            gain, sell = item.get("gain"), item.get("sell")
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            gain, sell = item
+        else:
+            continue
+        try:
+            price_tiers.append((float(gain), float(sell)))
+        except (TypeError, ValueError):
+            continue
+    price_tiers.sort()
+
     return ExitSpec(
         stop=StopSpec(
             kind=str(stop.get("kind", "entry_low")),
@@ -407,6 +482,7 @@ def spec_from_config(cfg: dict, strategy: Optional[str] = None) -> ExitSpec:
             kind=str(tp.get("kind", "pct")),
             pct=float(tp.get("pct", 0.15)),
             tiers=tiers,
+            price_tiers=tuple(price_tiers),
         ),
         time_stop=TimeStopSpec(
             max_holding_days=int(ts.get("max_holding_days", 20)),
@@ -416,6 +492,8 @@ def spec_from_config(cfg: dict, strategy: Optional[str] = None) -> ExitSpec:
         defense_ladder=bool(merged.get("defense_ladder", False)),
         strategy_exit=bool(merged.get("strategy_exit", False)),
         break_yellow_line=bool(merged.get("break_yellow_line", False)),
+        profit_to_loss=float(merged.get("profit_to_loss", 0.0) or 0.0),
+        close_below_prev_low=float(merged.get("close_below_prev_low", 0.0) or 0.0),
     )
 
 

@@ -1,16 +1,21 @@
 @echo off
-rem 只读行情 MCP 服务启动脚本。双击即可。
-rem token 存在 data\mcp_token.txt（不进 git），首次用
+rem Starts the read-only market-data MCP server. Double-click to run.
+rem The token lives in data\mcp_token.txt (not in git). Generate it with:
 rem   python -c "import secrets;print(secrets.token_urlsafe(32))" > data\mcp_token.txt
-rem 生成；两台机器都要用同一份。
+rem Both machines must use the same token.
+rem
+rem NOTE: keep this file pure ASCII + CRLF. cmd.exe reads .bat with the OEM
+rem code page (936 here), so UTF-8 Chinese comments can swallow the line
+rem breaks and merge the next command into a rem comment.
 cd /d "%~dp0"
 set /p MCP_TOKEN=<data\mcp_token.txt
 if "%MCP_TOKEN%"=="" (
-    echo [错误] data\mcp_token.txt 是空的，先生成 token 再启动。
+    echo [ERROR] data\mcp_token.txt is empty or missing. Generate a token first.
     pause
     exit /b 1
 )
-echo 只读行情 MCP 服务启动中（0.0.0.0:8765，本机内网 IP 用 ipconfig 查看）
-echo 审计日志：data\mcp_audit.jsonl   关闭服务：直接关掉本窗口
+echo Starting read-only MCP server on 0.0.0.0:8765
+echo From another machine use this PC's LAN IP (see ipconfig).
+echo Audit log: data\mcp_audit.jsonl    Stop: close this window
 python -m zhixing_quant.mcp_server --http --host 0.0.0.0 --port 8765
 pause

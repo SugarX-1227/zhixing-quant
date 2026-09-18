@@ -76,14 +76,58 @@ DEFAULT_EXTRA = ("sh000300", "sh000905", "sh000001", "sz399001")
 
 def pick_codes(src: sqlite3.Connection, size: int, min_amount: float,
                as_of: Optional[int]) -> List[str]:
-    """按 as_of 当日成交额取前 N 只。as_of 缺省用库里最新交易日。"""
+    """按 as_of 当日成交额取前 N 只。as_of 缺省用库里**最后一个完整交易日**。
+
+    ⚠️ 这里踩过一次坑：原实现直接用 `MAX(trade_date)` 当截面，隐含假设
+    最新一天的数据是完整的。实际上同步到一半、或当天只写进了一条记录时，
+    那一天只有个位数的股票——选池就只选出 1 只，加上基准共 5 只，
+    导出一个 0.5MB 的库，而脚本一声不吭还打印「自查通过」。
+
+    现在：先统计各交易日的记录数，取中位数作为「正常一天应有多少只」，
+    从后往前找第一个达到中位数一半的日子当截面；并在选出的只数明显
+    不足时**直接报错退出**，而不是导出一个残缺的库。
+
+    Args:
+        src: 只读连接。
+        size: 想要的只数。
+        min_amount: 成交额下限。
+        as_of: 指定截面日；缺省自动挑最后一个完整交易日。
+
+    Returns:
+        代码列表。
+
+    Raises:
+        RuntimeError: 选出的只数不足期望的一半。
+    """
     if as_of is None:
-        row = src.execute("SELECT MAX(trade_date) FROM daily_bar").fetchone()
-        as_of = int(row[0])
+        recent = src.execute(
+            "SELECT trade_date, COUNT(*) AS n FROM daily_bar "
+            "GROUP BY trade_date ORDER BY trade_date DESC LIMIT 60").fetchall()
+        if not recent:
+            raise RuntimeError("daily_bar 是空的。")
+        counts = sorted(r[1] for r in recent)
+        typical = counts[len(counts) // 2]
+        as_of = next((int(d) for d, n in recent if n >= typical * 0.5),
+                     int(recent[0][0]))
+        newest = int(recent[0][0])
+        if as_of != newest:
+            print(f"  最新交易日 {newest} 只有 "
+                  f"{dict((int(d), n) for d, n in recent)[newest]} 条记录"
+                  f"（正常约 {typical} 条），数据不完整，"
+                  f"改用 {as_of} 作为选池截面。")
+
     rows = src.execute(
         "SELECT code FROM daily_bar WHERE trade_date = ? AND amount >= ? "
         "ORDER BY amount DESC LIMIT ?", (as_of, min_amount, size)).fetchall()
-    return [r[0] for r in rows]
+    codes = [r[0] for r in rows]
+
+    if len(codes) < max(1, size // 2):
+        raise RuntimeError(
+            f"按 {as_of} 的成交额只选出 {len(codes)} 只，远少于期望的 {size} 只。"
+            "多半是那天的数据不完整，或者 --min-amount 设得太高。"
+            "导出一个残缺的库比报错更糟——那边会拿它跑出一堆看似正常的结论。"
+        )
+    return codes
 
 
 def export(db: Path, out: Path, codes: List[str], start: int, end: Optional[int],

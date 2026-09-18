@@ -408,3 +408,148 @@ def test_shipped_config_factor_section_is_valid():
         assert w, f"{strategy} 没有配到因子权重"
         for name in w:
             assert name in FACTOR_REGISTRY, f"{strategy} 的权重引用了未注册因子 {name}"
+
+
+# ---------------------------------------------------------------------------
+# 因子排序必须在**回测里**也生效
+# ---------------------------------------------------------------------------
+
+def test_engine_orders_same_day_signals_by_factor_score():
+    """每日开仓数有上限，同一天命中多只时先买哪只由排序决定。
+
+    这里曾经只按成交额排序，而因子排序只接在实盘扫描器里——改因子权重
+    跑回测结果一个字节都不变，因子层完全无法被验证。又一次把回测和实盘
+    劈成两套系统。
+    """
+    from zhixing_quant.backtest.engine import BacktestEngine
+
+    idx = pd.date_range("2024-01-01", periods=5, freq="B")
+    prepared = {}
+    for code, amount in (("600001", 9e8), ("600002", 1e8)):
+        df = pd.DataFrame({"open": 10.0, "high": 10.5, "low": 9.5,
+                           "close": 10.0, "amount": amount, "vol": 1e6,
+                           "sig": True}, index=idx)
+        prepared[code] = {
+            "df": df, "pos": {ts: i for i, ts in enumerate(idx)},
+            "open": df["open"].to_numpy(float), "high": df["high"].to_numpy(float),
+            "low": df["low"].to_numpy(float), "close": df["close"].to_numpy(float),
+            "sig": df["sig"].to_numpy(bool), "stop": df["low"].to_numpy(float),
+        }
+    eng = BacktestEngine({})
+    day = idx[2]
+
+    by_amount = [c for c, _ in eng._signals_on(prepared, day, "sig")]
+    assert by_amount == ["600001", "600002"], "没有分数时按成交额降序"
+
+    scores = {day: {"600001": -1.0, "600002": 2.0}}
+    by_score = [c for c, _ in eng._signals_on(prepared, day, "sig", scores)]
+    assert by_score == ["600002", "600001"], "有因子分时必须按分数排，不看成交额"
+
+
+def test_engine_puts_unscored_candidates_last():
+    """算不出因子分的不能冒到前面去。"""
+    from zhixing_quant.backtest.engine import BacktestEngine
+
+    idx = pd.date_range("2024-01-01", periods=3, freq="B")
+    prepared = {}
+    for code in ("600001", "600002"):
+        df = pd.DataFrame({"open": 10.0, "high": 10.5, "low": 9.5, "close": 10.0,
+                           "amount": 9e8, "vol": 1e6, "sig": True}, index=idx)
+        prepared[code] = {
+            "df": df, "pos": {ts: i for i, ts in enumerate(idx)},
+            "open": df["open"].to_numpy(float), "high": df["high"].to_numpy(float),
+            "low": df["low"].to_numpy(float), "close": df["close"].to_numpy(float),
+            "sig": df["sig"].to_numpy(bool), "stop": df["low"].to_numpy(float),
+        }
+    day = idx[1]
+    scores = {day: {"600002": -5.0}}          # 600001 没有分
+    order = [c for c, _ in BacktestEngine({})._signals_on(
+        prepared, day, "sig", scores)]
+    assert order == ["600002", "600001"]
+
+
+def test_build_rank_scores_returns_nothing_without_config():
+    from zhixing_quant.backtest.runner import build_rank_scores
+
+    scores, note = build_rank_scores({"factors": {"ranking": "amount"}},
+                                     "b2", {})
+    assert scores == {} and note == ""
+
+
+def test_build_rank_scores_produces_per_day_maps():
+    from zhixing_quant.backtest.runner import build_rank_scores
+
+    data = _market(12, 200)
+    cfg = {"factors": {"ranking": "custom", "weights": {"mom_20": 1.0}}}
+    scores, note = build_rank_scores(cfg, "b2", data)
+    assert scores, "应该算出分数"
+    day = next(iter(scores))
+    assert isinstance(scores[day], dict)
+    assert set(scores[day]) <= set(data)
+    assert "因子" in note or "自定义" in note
+
+
+def test_build_rank_scores_degrades_gracefully():
+    """算不出来时必须退回成交额排序，而不是把整个回测搞崩。"""
+    from zhixing_quant.backtest.runner import build_rank_scores
+
+    cfg = {"factors": {"ranking": "custom", "weights": {"mom_20": 1.0}}}
+    scores, note = build_rank_scores(cfg, "b2", {})
+    assert scores == {} and "成交额" in note
+
+
+def test_runner_passes_rank_scores_to_the_engine():
+    import inspect
+
+    from zhixing_quant.backtest import runner
+
+    src = inspect.getsource(runner.run_backtest)
+    assert "rank_scores=rank_scores" in src
+
+
+# ---------------------------------------------------------------------------
+# 稳定性筛选：只留样本内外都过关的因子
+# ---------------------------------------------------------------------------
+
+def test_stable_weights_drop_in_sample_only_factors():
+    """实测撞到过：atr_pct 样本内 ICIR +0.301(t=7.61)，样本外 +0.032(t=0.59)。
+    全样本口径仍会把它排到第二位，必须靠两段都要求显著来挡掉。"""
+    from zhixing_quant.factors.evaluate import stable_weights
+
+    is_s = pd.DataFrame([{"因子": "good", "ICIR": 0.30, "t值": 8.0},
+                         {"因子": "mirage", "ICIR": 0.30, "t值": 7.6}])
+    oos_s = pd.DataFrame([{"因子": "good", "ICIR": 0.28, "t值": 5.0},
+                          {"因子": "mirage", "ICIR": 0.03, "t值": 0.6}])
+    w = stable_weights(is_s, oos_s)
+    assert set(w) == {"good"}
+
+
+def test_stable_weights_reject_sign_flips():
+    from zhixing_quant.factors.evaluate import stable_weights
+
+    is_s = pd.DataFrame([{"因子": "flip", "ICIR": 0.30, "t值": 8.0}])
+    oos_s = pd.DataFrame([{"因子": "flip", "ICIR": -0.30, "t值": -8.0}])
+    assert stable_weights(is_s, oos_s) == {}
+
+
+def test_stable_weights_keep_consistently_reversed_factors():
+    from zhixing_quant.factors.evaluate import stable_weights
+
+    is_s = pd.DataFrame([{"因子": "rev", "ICIR": -0.26, "t值": -6.6}])
+    oos_s = pd.DataFrame([{"因子": "rev", "ICIR": -0.45, "t值": -8.4}])
+    assert stable_weights(is_s, oos_s)["rev"] < 0
+
+
+def test_stability_report_labels_each_case():
+    from zhixing_quant.factors.evaluate import stability_report
+
+    is_s = pd.DataFrame([{"因子": "stable", "ICIR": 0.3, "t值": 8.0},
+                         {"因子": "mirage", "ICIR": 0.3, "t值": 8.0},
+                         {"因子": "noise", "ICIR": 0.01, "t值": 0.2}])
+    oos_s = pd.DataFrame([{"因子": "stable", "ICIR": 0.28, "t值": 5.0},
+                          {"因子": "mirage", "ICIR": 0.02, "t值": 0.4},
+                          {"因子": "noise", "ICIR": 0.01, "t值": 0.3}])
+    verdicts = dict(zip(*stability_report(is_s, oos_s)[["因子", "判定"]].values.T))
+    assert verdicts["stable"] == "稳定"
+    assert "幻觉" in verdicts["mirage"]
+    assert verdicts["noise"] == "始终不显著"

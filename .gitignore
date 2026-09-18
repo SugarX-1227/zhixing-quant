@@ -17,3 +17,6 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+# 从 Release 拉下来的行情切片（可重新下载，见 scripts/fetch_slice.py）
+/data/market_slice.db*

@@ -173,10 +173,17 @@ def run_backtest(
     from zhixing_quant.portfolio.sizer import entry_spec_from_config
     entry_spec = entry_spec_from_config(cfg, strategy)
 
+    # 因子排序：同一天命中多只、每日开仓数有上限时，先买哪只由它决定。
+    # 必须和实盘扫描器读同一份配置，否则因子层就成了只在实盘生效、
+    # 回测里验证不了的摆设。
+    rank_scores, rank_note = build_rank_scores(cfg, strategy, data)
+    if rank_note:
+        warnings.append(rank_note)
+
     engine = BacktestEngine(cfg)
     result = engine.run(data, signal_col=sig_col, start_date=start, end_date=end,
                         regime=regime_map, exit_policy=exit_policy,
-                        entry_spec=entry_spec)
+                        entry_spec=entry_spec, rank_scores=rank_scores)
 
     warnings.extend(survivorship_warnings(get_store()))
 
@@ -223,6 +230,47 @@ def run_backtest(
         used_cfg=cfg,
     )
 
+
+
+def build_rank_scores(cfg: dict, strategy: str, data: Dict[str, pd.DataFrame]
+                      ) -> tuple:
+    """一次性算出整段区间的因子合成分，供引擎按日取用。
+
+    逐日现算的话，几百只 × 上千个交易日会把回测拖垮；这里走
+    `build_panel` + `score_panel` 的向量化路径，整段只算一次。
+
+    Returns:
+        ({日期: {代码: 分数}}, 说明文案)。没配因子排序时返回 ({}, "")，
+        引擎退回按成交额降序。
+    """
+    from zhixing_quant.scanner._core import ranking_weights
+
+    weights, label = ranking_weights(cfg, strategy)
+    if not weights:
+        return {}, ""
+    try:
+        from zhixing_quant.factors.cross_section import (build_panel, coverage,
+                                                         score_panel)
+
+        panel = build_panel(data, list(weights))
+        if panel.empty:
+            return {}, f"{label} 算不出因子面板，候选排序退回成交额降序。"
+        cov = coverage(panel)
+        dead = [n for n, v in cov.items() if v < 0.2]
+        score = score_panel(panel, weights)
+        score = score.dropna()
+        if score.empty:
+            return {}, f"{label} 一个因子都没算出有效值，候选排序退回成交额降序。"
+        out: Dict[object, Dict[str, float]] = {}
+        for (date, code), v in score.items():
+            out.setdefault(date, {})[code] = float(v)
+        note = f"候选排序：{label}（{len(weights)} 个因子）"
+        if dead:
+            note += f"；⚠ 覆盖率不足 20% 的因子：{'、'.join(dead)}，等于白给权重"
+        return out, note
+    except Exception as exc:
+        return {}, (f"因子排序失败，候选排序退回成交额降序："
+                    f"{type(exc).__name__}: {exc}")
 
 
 def collect_universe_pools(

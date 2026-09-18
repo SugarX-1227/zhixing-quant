@@ -112,11 +112,19 @@ def main() -> None:
     download(url, tmp)
     print(f"  已下载 {tmp}")
 
+    # 先算哈希再解压：发布方会公布 sha256，两边对得上才能确认传输无损。
+    # 原实现解压后直接把 .gz 删了，事后想核对都没得核对。
+    import hashlib
+
+    digest = hashlib.sha256(tmp.read_bytes()).hexdigest()
+    print(f"  sha256 {digest}")
+    print("  （和发布方公布的哈希对一下，不一致说明传输有损）")
+
     if name.endswith(".gz"):
         with gzip.open(tmp, "rb") as fi, open(out, "wb") as fo:
             shutil.copyfileobj(fi, fo)
-        tmp.unlink()
-        print(f"  已解压 → {out}（{out.stat().st_size / 1e6:.1f} MB）")
+        print(f"  已解压 → {out}（{out.stat().st_size / 1e6:.1f} MB）"
+              f"；压缩包保留在 {tmp.name} 供核对")
     elif tmp != out:
         tmp.replace(out)
 

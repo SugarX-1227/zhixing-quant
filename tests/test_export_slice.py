@@ -181,12 +181,36 @@ def test_pick_codes_ranks_by_amount(full_db):
     assert codes[0] == "sh000300", "成交额最大的应排第一"
 
 
-def test_pick_codes_respects_min_amount(full_db):
+def test_pick_codes_raises_when_the_slice_would_be_crippled(full_db):
+    """选不出足够的票时必须报错退出。
+
+    原实现直接返回一个残缺列表，导出 0.5MB 的库还打印「自查通过」——
+    发布方踩过这个坑。导出残缺的库比报错糟得多，因为那边会拿它跑出
+    一堆看似正常的结论。
+    """
     c = sqlite3.connect(f"file:{full_db}?mode=ro", uri=True)
     try:
-        assert pick_codes(c, size=10, min_amount=1e12, as_of=None) == []
+        with pytest.raises(RuntimeError, match="远少于期望"):
+            pick_codes(c, size=10, min_amount=1e12, as_of=None)
     finally:
         c.close()
+
+
+def test_pick_codes_skips_an_incomplete_latest_day(full_db, tmp_path):
+    """最新一天只同步了一条记录时，不能拿它当选池截面。"""
+    db = tmp_path / "partial.db"
+    import shutil
+    shutil.copy(full_db, db)
+    c = sqlite3.connect(db)
+    c.execute("INSERT INTO daily_bar VALUES ('600000',20240201,1,1,1,1,1e8,1e6)")
+    c.commit()
+    c.close()
+    ro = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        codes = pick_codes(ro, size=4, min_amount=0, as_of=None)
+    finally:
+        ro.close()
+    assert len(codes) >= 2, "应回退到最后一个完整交易日，而不是只选出 1 只"
 
 
 def test_benchmark_indexes_are_in_the_default_extras():

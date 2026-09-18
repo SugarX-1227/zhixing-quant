@@ -137,6 +137,7 @@ class BacktestEngine:
         regime: Optional[Dict[str, str]] = None,
         exit_policy=None,
         entry_spec=None,
+        rank_scores=None,
     ) -> BacktestResult:
         """跑一次回测。
 
@@ -148,6 +149,9 @@ class BacktestEngine:
             take_profit_pct: 止盈比例。
             exit_fn: 可选自定义卖出判断 (df, idx, position) -> Optional[str]，
                      返回卖出原因字符串表示卖出。exit_policy 优先。
+            rank_scores: {日期: {代码: 因子合成分}}。同一天命中多只、但每日
+                     开仓数有上限时，用它决定先买哪只。不给则退回按成交额
+                     降序——那是流动性代理，和这只票接下来会不会涨没关系。
             entry_spec: portfolio/sizer.EntrySpec。给了就按「底仓 + 分批加仓」
                      建仓（规划书 6.2.1 B1 五步循环的第 1、3 步）；不给则
                      一只标的只建一次仓，规模由 backtest.sizing 决定。
@@ -371,7 +375,8 @@ class BacktestEngine:
                     and (len(positions) < self.max_positions or can_scale)
                     and regime_map.get(
                         calendar[day_i + 1].strftime("%Y-%m-%d"), "NEUTRAL") != "BEAR"):
-                signals = self._signals_on(prepared, date, signal_col)
+                signals = self._signals_on(prepared, date, signal_col,
+                                           rank_scores)
                 for code, info in signals[: self.max_entries_per_day]:
                     held = positions.get(code)
                     if held is None or self._can_add(held, entry_spec):
@@ -447,19 +452,35 @@ class BacktestEngine:
             "low": item["low"][i], "close": item["close"][i],
         }
 
-    def _signals_on(self, prepared: dict, date, signal_col: str) -> List[tuple]:
-        """返回当日触发买入信号的股票，按成交额降序。"""
+    def _signals_on(self, prepared: dict, date, signal_col: str,
+                    rank_scores=None) -> List[tuple]:
+        """返回当日触发买入信号的股票，按**因子合成分**降序（没有就按成交额）。
+
+        每日开仓数有上限，所以「同一天命中 20 只、只能买 2 只」时，
+        这个排序直接决定买到的是哪两只。
+
+        ⚠️ 这里曾经只按成交额排序，而因子排序只接在实盘扫描器里——
+        于是因子层完全无法被回测验证：改因子权重跑回测，结果一个字节都不变。
+        又一次把回测和实盘劈成两套系统。现在两边读同一份打分。
+        """
+        day_scores = (rank_scores or {}).get(date) or {}
         hits = []
         for code, item in prepared.items():
             i = item["pos"].get(date)
             if i is None or not item["sig"][i]:
                 continue
-            amount = float(item["df"]["amount"].iloc[i]) if "amount" in item["df"].columns else 0.0
+            amount = (float(item["df"]["amount"].iloc[i])
+                      if "amount" in item["df"].columns else 0.0)
             hits.append(
                 (code, {"code": code, "signal_close": item["close"][i],
                         "stop": float(item["stop"][i]), "amount": amount})
             )
-        hits.sort(key=lambda x: x[1]["amount"], reverse=True)
+        if day_scores:
+            # 算不出分的排在最后，同分再按成交额；不让 NaN 冒到前面去
+            hits.sort(key=lambda x: (day_scores.get(x[0], float("-inf")),
+                                     x[1]["amount"]), reverse=True)
+        else:
+            hits.sort(key=lambda x: x[1]["amount"], reverse=True)
         return hits
 
     def _is_limit_up_open(self, prepared: dict, code: str, date) -> bool:

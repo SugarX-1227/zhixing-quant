@@ -217,6 +217,87 @@ def weights_from_ic(summary: pd.DataFrame, max_factors: int = 6,
             for _, r in df.iterrows()}
 
 
+def stable_weights(is_summary: pd.DataFrame, oos_summary: pd.DataFrame,
+                   max_factors: int = 6, min_abs_t: float = T_SIGNIFICANT
+                   ) -> Dict[str, float]:
+    """只留**样本内外都显著、且方向一致**的因子，权重按两段 ICIR 的几何均值。
+
+    为什么不能只看全样本：全样本把样本内外混在一起算，一个只在样本内有效
+    的因子照样能排进前列。2026-09 实测就撞上了——`atr_pct` 样本内
+    ICIR +0.301（t=7.61），样本外掉到 +0.032（t=0.59），完全失效，
+    但全样本 ICIR 仍有 +0.200，自动配权重时被排到第二位。
+
+    要求两段同时显著且同号，等于让因子自己先过一次样本外考试。
+    权重用几何均值（保留符号）而不是算术平均：一段强一段弱的因子会被
+    压下去，两段都稳的才能拿高权重。
+
+    Args:
+        is_summary / oos_summary: 两段各自的 ic_summary 输出。
+        max_factors: 最多留几个。
+        min_abs_t: 两段都要达到的显著性门槛。
+
+    Returns:
+        {因子名: 权重}，最大权重归一化到 1；方向相反的取负权重。
+        没有因子两段都过关时返回空——那说明这批因子没有稳定的方向，
+        应该退回不排序。
+    """
+    if (is_summary is None or oos_summary is None
+            or is_summary.empty or oos_summary.empty):
+        return {}
+    a = is_summary.set_index("因子")
+    b = oos_summary.set_index("因子")
+    rows = []
+    for name in a.index.intersection(b.index):
+        ta, tb = float(a.loc[name, "t值"]), float(b.loc[name, "t值"])
+        ia, ib = float(a.loc[name, "ICIR"]), float(b.loc[name, "ICIR"])
+        if abs(ta) < min_abs_t or abs(tb) < min_abs_t:
+            continue
+        if np.sign(ia) != np.sign(ib):       # 两段方向相反 = 没有稳定方向
+            continue
+        rows.append((name, np.sign(ia) * float(np.sqrt(abs(ia) * abs(ib)))))
+    if not rows:
+        return {}
+    rows.sort(key=lambda kv: -abs(kv[1]))
+    rows = rows[:int(max_factors)]
+    peak = max(abs(v) for _, v in rows)
+    return {k: round(v / peak, 3) for k, v in rows}
+
+
+def stability_report(is_summary: pd.DataFrame,
+                     oos_summary: pd.DataFrame) -> pd.DataFrame:
+    """每个因子在样本内外的表现对照，直接看出哪些是样本内幻觉。"""
+    if is_summary is None or oos_summary is None:
+        return pd.DataFrame()
+    a = is_summary.set_index("因子")
+    b = oos_summary.set_index("因子")
+    rows = []
+    for name in a.index.union(b.index):
+        ia = float(a.loc[name, "ICIR"]) if name in a.index else float("nan")
+        ib = float(b.loc[name, "ICIR"]) if name in b.index else float("nan")
+        ta = float(a.loc[name, "t值"]) if name in a.index else 0.0
+        tb = float(b.loc[name, "t值"]) if name in b.index else 0.0
+        ok_a, ok_b = abs(ta) >= T_SIGNIFICANT, abs(tb) >= T_SIGNIFICANT
+        if ok_a and ok_b and np.sign(ia) == np.sign(ib):
+            verdict = "稳定" + ("（反向用）" if ia < 0 else "")
+        elif ok_a and not ok_b:
+            verdict = "⚠ 样本内幻觉"
+        elif ok_b and not ok_a:
+            verdict = "只在样本外显著，存疑"
+        elif ok_a and ok_b:
+            verdict = "⚠ 两段方向相反"
+        else:
+            verdict = "始终不显著"
+        rows.append({"因子": name, "样本内ICIR": round(ia, 3),
+                     "样本外ICIR": round(ib, 3), "判定": verdict})
+    out = pd.DataFrame(rows)
+    order = {"稳定": 0, "稳定（反向用）": 0, "⚠ 样本内幻觉": 1,
+             "只在样本外显著，存疑": 2, "⚠ 两段方向相反": 3, "始终不显著": 4}
+    return out.sort_values(
+        ["判定", "样本外ICIR"],
+        key=lambda c: c.map(order) if c.name == "判定" else -c.abs()
+    ).reset_index(drop=True)
+
+
 def weights_as_yaml(weights: Dict[str, float], strategy: str = "b2") -> str:
     """把权重渲染成可以直接粘进 settings.yaml 的片段。"""
     if not weights:

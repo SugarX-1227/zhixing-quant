@@ -687,16 +687,24 @@ def page_data(cfg, book):
         if not h.get("warnings"):
             st.success(f"数据正常，上次同步 {h['last_sync']}")
 
-    c = st.columns([1, 1, 1, 2])
+    c = st.columns([1, 1, 1, 1.3])
     names = c[0].checkbox("更新名称")
     xdxr = c[1].checkbox("更新除权除息", help="需要 pytdx")
     full = c[2].checkbox("全量重建")
+    oamv = c[3].checkbox("同步活跃市值", value=True,
+                         help="指南针 0AMV 指标入库。需先完全退出指南针软件；"
+                              "当天数据要收盘后指南针写入才有")
     if st.button("立即同步", type="primary"):
         cmd = [sys.executable, "-m", "zhixing_quant.data.sync"]
-        cmd += ["--full"] * full + ["--names"] * names + ["--xdxr"] * xdxr
+        cmd += (["--full"] * full + ["--names"] * names + ["--xdxr"] * xdxr
+                + ["--oamv"] * oamv)
         with st.spinner("同步中..."):
             p = subprocess.run(cmd, capture_output=True, text=True)
         st.code(p.stdout or p.stderr, language="text")
+        # K 线同步成功但活跃市值/除权等后续步骤失败时，报错在 stderr，
+        # 只显示 stdout 会把它吞掉
+        if p.returncode != 0 and p.stderr.strip():
+            st.error(f"同步有一步失败了（退出码 {p.returncode}）：\n\n{p.stderr.strip()}")
         from zhixing_quant.data.tdx_loader import reset_store
         reset_store()
         _health.clear()

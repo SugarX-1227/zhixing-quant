@@ -961,7 +961,17 @@ PAGES = {"今日": page_today, "持仓": page_positions, "战法": page_strategi
 
 
 def main():
-    cfg = get_config()
+    try:
+        cfg = get_config()
+    except Exception as exc:
+        # 配置校验没过就别往下走了——带着静默失效的配置跑出来的结果
+        # 比报错更糟，因为你会当真。
+        st.error(f"配置加载失败\n\n```\n{exc}\n```")
+        st.stop()
+
+    from zhixing_quant.config import config_warnings
+    for w in config_warnings():
+        st.sidebar.warning(w)
 
     st.sidebar.markdown(
         "<div style='padding:2px 4px 12px;font-size:16px;font-weight:600'>知行</div>",

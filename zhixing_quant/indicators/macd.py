@@ -45,24 +45,32 @@ def add_macd(
     out["macd_hist"] = macd_hist
     out["above_zero"] = dif > 0
 
-    # Bull/bear divergence: find local lows/highs manually
-    bull_div = pd.Series(False, index=close.index)
-    bear_div = pd.Series(False, index=close.index)
-    for i in range(divergence_window, len(close)):
-        win_p = close.iloc[i - divergence_window : i + 1]
-        win_d = dif.iloc[i - divergence_window : i + 1]
-        p_low_idx = win_p.idxmin()
-        d_low_idx = win_d.idxmin()
-        p_prev_low_idx = win_p.iloc[:-1].idxmin() if len(win_p) > 1 else p_low_idx
-        d_prev_low_idx = win_d.iloc[:-1].idxmin() if len(win_d) > 1 else d_low_idx
-        cur_p = float(close.iloc[i])
-        prev_p = float(close.loc[p_prev_low_idx]) if p_prev_low_idx in close.index else cur_p
-        cur_d = float(dif.iloc[i])
-        prev_d = float(dif.loc[d_prev_low_idx]) if d_prev_low_idx in dif.index else cur_d
-        if cur_p < prev_p and cur_d > prev_d:
-            bull_div.iloc[i] = True
-        if cur_p > prev_p and cur_d < prev_d:
-            bear_div.iloc[i] = True
+    # 背离。原实现是逐根 K 线切片 + idxmin 的 Python 循环，单只 1200 根
+    # K 线要 246ms，占整条防守流水线 90% 的时间——消融和参数校准动辄跑
+    # 几十次回测，这一处就是主瓶颈。改成滚动窗口的向量化写法。
+    #
+    # ⚠️ 同时修掉一个判据错误：**顶背离原本拿窗口最低点当「前高」比**。
+    #
+    #     p_prev_low_idx = win_p.iloc[:-1].idxmin()      # 最低点
+    #     if cur_p > prev_p and cur_d < prev_d:          # 却用于顶背离
+    #
+    # 「今天收盘高于过去 60 天最低点」几乎恒为真，所以那个条件实际退化成
+    # 「DIF 跌破过去 60 天最低」——和顶背离（价格创新高、DIF 不创新高）
+    # 完全是两回事。而 signals/macd_veto.py 正拿它否决买入信号，
+    # 等于按一个错误的条件在拦单。顶背离现在按定义比**前高**。
+    #
+    # 窗口口径与原实现一致：比较对象是 [i-W, i-1] 这 W 根，不含当日。
+    prev_low_p = close.shift(1).rolling(divergence_window).min()
+    prev_low_d = dif.shift(1).rolling(divergence_window).min()
+    prev_high_p = close.shift(1).rolling(divergence_window).max()
+    prev_high_d = dif.shift(1).rolling(divergence_window).max()
+
+    # 底背离：价格创新低，DIF 不创新低
+    bull_div = (close < prev_low_p) & (dif > prev_low_d)
+    # 顶背离：价格创新高，DIF 不创新高
+    bear_div = (close > prev_high_p) & (dif < prev_high_d)
+    bull_div = bull_div.fillna(False)
+    bear_div = bear_div.fillna(False)
 
     out["bull_divergence"] = bull_div
     out["bear_divergence"] = bear_div
@@ -74,30 +82,3 @@ def add_macd(
     out["false_death_cross"] = death & (dif.diff() > 0)
 
     return out
-
-
-def _find_divergence(
-    price: pd.Series,
-    dif: pd.Series,
-    price_low_idx: pd.Series,
-    dif_low_idx: pd.Series,
-    kind: str,
-) -> pd.Series:
-    """Detect price-indicator divergence."""
-    result = pd.Series(False, index=price.index)
-    for i in range(len(price)):
-        if pd.isna(price_low_idx.iloc[i]) or pd.isna(dif_low_idx.iloc[i]):
-            continue
-        p_idx = price.index.get_loc(price_low_idx.iloc[i])
-        d_idx = dif.index.get_loc(dif_low_idx.iloc[i])
-        if p_idx != d_idx:
-            continue
-        cur_p = float(price.iloc[i])
-        prev_p = float(price.iloc[p_idx]) if p_idx > 0 else cur_p
-        cur_d = float(dif.iloc[i])
-        prev_d = float(dif.iloc[d_idx]) if d_idx > 0 else cur_d
-        if kind == "bull":
-            result.iloc[i] = cur_p < prev_p and cur_d > prev_d
-        else:
-            result.iloc[i] = cur_p > prev_p and cur_d < prev_d
-    return result

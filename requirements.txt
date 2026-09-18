@@ -10,6 +10,10 @@ plotly==5.24.1
 # 测试
 pytest==8.4.2
 
+# 可选：只读行情 MCP 服务（zhixing_quant/mcp_server.py）。
+# 只在对外提供 MCP 服务的数据机那台需要装，另一台机器的客户端不需要。
+# pip install mcp
+
 # 可选：股票名称 + 除权除息。
 # 不装也能跑，但 ST 过滤会失效、价格是不复权的。
 # pip install pytdx

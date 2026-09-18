@@ -59,6 +59,56 @@ data:
 
 浏览器打开 http://localhost:8501，七个页面：今日 / 持仓 / 战法 / 回测 / 因子 / 个股 / 数据。
 
+## 只读行情 MCP 服务（多机协作）
+
+行情库 `data/market.db` 不进 git，另一台机器只有代码没有数据。在有数据的那台
+机器上起一个只读 MCP 服务，另一台机器的 AI 客户端就能直接查 K 线 / 除权 /
+活跃市值，不需要拷贝 2GB 的库文件：
+
+```bash
+pip install mcp                                   # 仅服务端机器需要
+python -c "import secrets;print(secrets.token_urlsafe(32))"   # 生成 token
+set MCP_TOKEN=<上面生成的 token>
+python -m zhixing_quant.mcp_server --http --host 0.0.0.0 --port 8765
+```
+
+安全模型：三层只读（SQLite `mode=ro` 连接 / 只放行单条 SELECT / 行情表白名单），
+`position`、`trade_log` 等个人交易表完全不出现在服务里；每次调用追加审计到
+`data/mcp_audit.jsonl`（`tail -f` 实时看）。个人交易表、写入语句、多语句一律拒绝。
+
+另一台机器的 MCP 客户端配置（streamable HTTP）：
+
+```json
+{
+  "mcpServers": {
+    "zhixing-quant-ro": {
+      "url": "http://<数据机IP>:8765/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+同局域网直连即可；跨公网请套 Tailscale/WireGuard 之类的加密隧道，不要裸暴露
+端口。本机自用则更简单（stdio，无需 token）：
+
+```json
+{
+  "mcpServers": {
+    "zhixing-quant-ro": {
+      "command": "python",
+      "args": ["-m", "zhixing_quant.mcp_server"]
+    }
+  }
+}
+```
+
+代码口径提醒（工具描述里也写了）：个股 6 位数字，指数必须带 `sh`/`sz` 前缀
+（`sh000001` 是上证指数，`000001` 是平安银行）；价格是不复权原始价。
+
+注意边界：MCP 只解决「查数据」。要在另一台机器上**跑回测**，还是得把
+`data/market.db` 整个拷过去（单文件，scp / 网盘均可），或远程到数据机跑。
+
 ## 关于复权（重要）
 
 通达信 `.day` 文件里存的是**不复权原始价格**。遇到送股、派息，价格会凭空跳一个缺口，

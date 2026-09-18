@@ -249,6 +249,23 @@ def page_strategies(cfg, book):
     _list_and_chart(cands, charts, key="strat")
 
 
+def _active_switches(cfg, strategy):
+    from zhixing_quant.backtest.ablation import active_switches
+    try:
+        return active_switches(cfg, strategy)
+    except Exception:
+        return []
+
+
+def local_cfg_of(run):
+    """消融要用本次回测实际生效的那份配置（含界面上的参数覆盖）。
+
+    拿全局配置去跑会把「出场规则」页签上改过的参数丢掉，
+    消融出来的结论和上面那张结果表就不是一回事了。
+    """
+    return getattr(run, "used_cfg", None) or get_config()
+
+
 def _list_and_chart(cands: pd.DataFrame, charts: dict, key: str):
     """左列表 + 右K线。点列表里哪只，右边就画哪只。
 
@@ -455,6 +472,54 @@ def page_backtest(cfg, book):
         right.markdown("**卖出原因**")
         counts = run.trades["exit_reason"].value_counts()
         right.dataframe(counts.rename("笔数"), use_container_width=True)
+
+    # ---- 出场规则消融：逐条关掉，看每条各自贡献多少 ----
+    C.section("出场规则消融", "规则叠多了靠直觉判断不出哪条有用，逐条关掉实测",
+              f"当前启用 {len(_active_switches(local_cfg_of(run), name))} 条")
+    st.caption("保持其余规则不变，只关掉一条重跑。关掉后收益**变高** = 这条在亏钱；"
+               "**变低** = 这条在赚钱；**不变** = 从未触发，是摆设。"
+               "⚠️ 这是诊断工具，不是调参工具——在同一段历史上反复删规则留下最好看的"
+               "组合就是在拟合噪声，删之前先在样本外确认。")
+    ab1, ab2 = st.columns([1.4, 4])
+    mode = ab1.radio("视角", ["逐一关掉", "逐一只开"], horizontal=True,
+                     key="ab_mode",
+                     help="两种视角一起看：两条规则能救同一笔单子时，"
+                          "各自的「关掉」影响都会显得很小，但「只开」能看出真实效果")
+    if ab2.button(f"跑消融（要跑 N+1 次回测，比单次慢很多）", key="ab_go"):
+        from zhixing_quant.backtest.ablation import ablate_exits
+        bar = st.progress(0.0, text="准备...")
+        try:
+            table = ablate_exits(
+                local_cfg_of(run), name, start.strftime("%Y%m%d"),
+                end.strftime("%Y%m%d"), spec=spec,
+                universe_as_of=start.strftime("%Y%m%d"),
+                only_one=(mode == "逐一只开"),
+                progress=lambda d, t, n: bar.progress(min(d / max(t, 1), 1.0),
+                                                      text=f"{d}/{t} {n}"))
+        except Exception as exc:
+            bar.empty()
+            st.error(f"消融失败：{exc}")
+            table = None
+        else:
+            bar.empty()
+            st.session_state["ablation"] = table
+
+    table = st.session_state.get("ablation")
+    if table is not None and not table.empty:
+        from zhixing_quant.backtest.ablation import summarize
+        for line in summarize(table):
+            st.info(line)
+        view = table[["规则", "总收益", "最大回撤", "夏普", "胜率", "笔数",
+                      "Δ总收益", "Δ最大回撤", "Δ笔数", "判定"]]
+        st.dataframe(view, use_container_width=True, hide_index=True,
+                     column_config={
+                         "总收益": st.column_config.NumberColumn(format="%.2%"),
+                         "最大回撤": st.column_config.NumberColumn(format="%.2%"),
+                         "胜率": st.column_config.NumberColumn(format="%.1%"),
+                         "夏普": st.column_config.NumberColumn(format="%.2f"),
+                         "Δ总收益": st.column_config.NumberColumn(format="%.2%"),
+                         "Δ最大回撤": st.column_config.NumberColumn(format="%.2%"),
+                     })
 
     # 活跃市值区间触发日志（空头=-2.3%，多头=单日+4%或三日连涨和>4%）
     regime_log = getattr(run, "regime_log", None)
@@ -797,13 +862,64 @@ def page_factors(cfg, book):
                      "t值": st.column_config.NumberColumn(format="%.2f"),
                      "正IC占比": st.column_config.NumberColumn(format="%.1%"),
                  })
+    st.caption("「方向」列最该先看：IC 已按因子声明的方向调过符号，所以"
+               "**负 IC 意味着这个因子在这段样本里是反着的**。")
 
-    strong = summary[summary["ICIR"].abs() >= 0.3]
-    if strong.empty:
-        st.info("没有任何因子的 |ICIR| 达到 0.3。要么这批因子在这段行情里无效，"
-                "要么样本太短。别急着拿去配权重。")
-    else:
-        st.success("达到 |ICIR| ≥ 0.3 的因子：" + "、".join(strong["因子"]))
+    # 方向诊断：IC 已按声明方向调过符号，所以负 IC = 这个因子在这段样本里是反着的
+    flipped = summary[summary["方向"] == "⚠ 相反"]
+    agreed = summary[summary["方向"] == "一致"]
+    if not flipped.empty:
+        st.error(
+            f"**{len(flipped)} 个因子的实测方向与声明相反**："
+            + "、".join(flipped["因子"])
+            + "。按声明方向给它们正权重，等于系统性地挑最差的标的。"
+              "下面的「按实测 IC 生成权重」会自动把这些反过来用。")
+    if agreed.empty:
+        st.warning("没有任何因子的方向是显著一致的。这批因子在这段样本里都没用，"
+                   "应该退回不排序（`factors.by_strategy.<战法>: amount`），"
+                   "而不是硬凑一个组合。")
+
+    # 预设组合在实测 IC 下的净方向——预设是拍脑袋给的，必须拿数据打分
+    from zhixing_quant.factors.library import PRESETS
+
+    icir_of = dict(zip(summary["因子"], summary["ICIR"]))
+    preset_rows = []
+    for key, meta in PRESETS.items():
+        w = {k: v for k, v in meta["weights"].items() if k in icir_of}
+        if not w:
+            continue
+        tot = sum(abs(v) for v in w.values()) or 1.0
+        preset_rows.append({
+            "预设组合": f"{meta['label']}（{key}）",
+            "加权净ICIR": round(sum(icir_of[k] * v for k, v in w.items()) / tot, 3),
+            "反向因子数": sum(1 for k, v in w.items() if icir_of[k] * v < 0),
+            "因子数": len(w),
+        })
+    if preset_rows:
+        pr = pd.DataFrame(preset_rows).sort_values("加权净ICIR", ascending=False)
+        st.markdown("**预设组合打分**（净 ICIR 为负 = 这个组合在帮你挑最差的）")
+        st.dataframe(pr, use_container_width=True, hide_index=True,
+                     column_config={"加权净ICIR":
+                                    st.column_config.NumberColumn(format="%.3f")})
+
+    # 按实测 IC 直接生成权重，替代拍脑袋
+    with st.expander("按实测 IC 生成权重（推荐，替代预设）", expanded=not flipped.empty):
+        from zhixing_quant.factors.evaluate import weights_as_yaml, weights_from_ic
+
+        g = st.columns([1, 1, 1, 2])
+        n_max = g[0].number_input("最多留几个因子", 2, 12, 6, key="wg_n",
+                                  help="留太多等于在短样本上过拟合")
+        min_t = g[1].number_input("显著性门槛 |t|", 1.0, 5.0, 2.0, 0.5, key="wg_t")
+        flip = g[2].checkbox("允许反向使用", value=True, key="wg_flip",
+                             help="关掉则直接剔除方向相反的因子，而不是反过来用")
+        target = g[3].selectbox("写给哪个战法", ["b1", "b2", "brick"], index=1,
+                                key="wg_target")
+        gen = weights_from_ic(summary, max_factors=int(n_max),
+                              min_abs_t=float(min_t), allow_flip=bool(flip))
+        st.code(weights_as_yaml(gen, target), language="yaml")
+        st.caption("粘进 `config/settings.yaml`。负权重表示该因子实测方向与声明"
+                   "相反，反着用。⚠️ 这是在**同一段样本**上拟合出来的权重，"
+                   "换个区间再跑一遍确认稳定了再上。")
 
     pick = st.selectbox("看哪个因子的分层收益", list(summary["因子"]),
                         format_func=lambda n: label_of.get(n, n))

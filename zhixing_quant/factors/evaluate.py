@@ -124,8 +124,8 @@ def ic_summary(ic: pd.DataFrame) -> pd.DataFrame:
         按 |ICIR| 降序——稳定性比幅度更值得先看。
     """
     if ic is None or ic.empty:
-        return pd.DataFrame(columns=["IC均值", "IC标准差", "ICIR", "t值",
-                                     "正IC占比", "有效天数"])
+        return pd.DataFrame(columns=["因子", "IC均值", "IC标准差", "ICIR", "t值",
+                                     "方向", "正IC占比", "有效天数"])
     rows = []
     for name in ic.columns:
         s = ic[name].dropna()
@@ -134,13 +134,15 @@ def ic_summary(ic: pd.DataFrame) -> pd.DataFrame:
             continue
         mean, std = float(s.mean()), float(s.std())
         icir = mean / std if std > 0 else 0.0
+        t = icir * np.sqrt(n)
         rows.append({
             "因子": name,
             "IC均值": round(mean, 4),
             "IC标准差": round(std, 4),
             "ICIR": round(icir, 3),
             # IC 序列近似独立，t = ICIR × sqrt(n)
-            "t值": round(icir * np.sqrt(n), 2),
+            "t值": round(t, 2),
+            "方向": direction_verdict(t),
             "正IC占比": round(float((s > 0).mean()), 3),
             "有效天数": n,
         })
@@ -149,6 +151,83 @@ def ic_summary(ic: pd.DataFrame) -> pd.DataFrame:
         return out
     return out.reindex(out["ICIR"].abs().sort_values(ascending=False).index
                        ).reset_index(drop=True)
+
+
+T_SIGNIFICANT = 2.0          # |t| 达到这个值才认为方向是真的，不是噪声
+
+
+def direction_verdict(t: float) -> str:
+    """因子声明的方向和实测方向对不对得上。
+
+    IC 已经按 `Factor.direction` 调过符号，所以：
+        t > +2   实测与声明一致，可以用
+        t < -2   **实测与声明相反**——这个因子在这段样本里是反着的，
+                 照声明的方向给它正权重，等于系统性地挑最差的标的
+        其余     不显著，给它权重等于把权重丢掉
+
+    这一列是整张表里最该先看的。本项目的预设权重是拍脑袋给的初始值，
+    实测下来有的组合 3/5 个因子方向都是反的。
+    """
+    if not np.isfinite(t):
+        return "不显著"
+    if t >= T_SIGNIFICANT:
+        return "一致"
+    if t <= -T_SIGNIFICANT:
+        return "⚠ 相反"
+    return "不显著"
+
+
+def weights_from_ic(summary: pd.DataFrame, max_factors: int = 6,
+                    min_abs_t: float = T_SIGNIFICANT,
+                    allow_flip: bool = True) -> Dict[str, float]:
+    """直接从实测 IC 生成因子权重，替代拍脑袋配权重。
+
+    规则很简单，刻意不做复杂优化（因子少、样本短的时候，复杂加权
+    只会把噪声也一起拟合进去）：
+
+    1. 只保留 |t| >= min_abs_t 的因子，其余一律丢掉；
+    2. 权重 ∝ ICIR 的绝对值，归一化到最大权重为 1；
+    3. 实测方向与声明相反的因子（ICIR < 0），权重取负——等价于反着用它。
+       `allow_flip=False` 则直接剔除这类因子。
+
+    Args:
+        summary: ic_summary 的输出。
+        max_factors: 最多留几个。留太多等于在短样本上过拟合。
+        min_abs_t: 显著性门槛。
+        allow_flip: 是否允许把方向相反的因子反过来用。
+
+    Returns:
+        {因子名: 权重}，可直接写进 settings.yaml 的 factors.weights。
+        没有任何因子达标时返回空字典——那说明这批因子在这段样本里
+        都没用，**应该退回不排序，而不是硬凑一个组合出来**。
+    """
+    if summary is None or summary.empty or "t值" not in summary.columns:
+        return {}
+    df = summary[summary["t值"].abs() >= float(min_abs_t)].copy()
+    if not allow_flip:
+        df = df[df["t值"] > 0]
+    if df.empty:
+        return {}
+    df = df.reindex(df["ICIR"].abs().sort_values(ascending=False).index)
+    df = df.head(int(max_factors))
+    peak = df["ICIR"].abs().max()
+    if not np.isfinite(peak) or peak == 0:
+        return {}
+    return {str(r["因子"]): round(float(r["ICIR"]) / peak, 3)
+            for _, r in df.iterrows()}
+
+
+def weights_as_yaml(weights: Dict[str, float], strategy: str = "b2") -> str:
+    """把权重渲染成可以直接粘进 settings.yaml 的片段。"""
+    if not weights:
+        return ("# 没有因子达到显著性门槛。这批因子在这段样本里都没用，\n"
+                "# 应该退回不排序：factors.by_strategy.%s: amount" % strategy)
+    lines = ["factors:", "  by_strategy:", f"    {strategy}: custom",
+             "  weights:"]
+    for k, v in sorted(weights.items(), key=lambda kv: -abs(kv[1])):
+        note = "  # 实测方向与声明相反，这里反着用" if v < 0 else ""
+        lines.append(f"    {k}: {v}{note}")
+    return "\n".join(lines)
 
 
 def quantile_returns(panel: pd.DataFrame, fwd: pd.Series, factor: str,

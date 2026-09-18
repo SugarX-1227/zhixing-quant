@@ -40,6 +40,9 @@ class BacktestRun:
     regime_log: pd.DataFrame = field(default_factory=pd.DataFrame)  # 区间触发日志
     exit_note: str = ""            # 本次实际生效的出场规则，界面要显示出来
     entry_note: str = ""           # 本次实际生效的建仓规则
+    # 本次实际用的配置（含界面上的参数覆盖）。消融分析要在**同一份**配置上
+    # 逐条关规则，拿全局配置去跑会把界面改过的参数丢掉，结论就不可比了。
+    used_cfg: dict = field(default_factory=dict)
 
     @property
     def drawdown(self) -> pd.Series:
@@ -217,6 +220,7 @@ def run_backtest(
         regime_log=regime_log.reset_index(drop=True),
         exit_note=exit_spec.describe(),
         entry_note=entry_spec.describe(),
+        used_cfg=cfg,
     )
 
 

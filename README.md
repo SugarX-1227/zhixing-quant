@@ -143,6 +143,38 @@ zhixing_quant/
 tests/                      pytest
 ```
 
+## 把数据给到云端 AI 会话
+
+`data/market.db` 不进 git（2GB，且每天在变）。云端会话读不到本机数据时，
+用「导出切片 → GitHub Release → 云端下载」这条路：
+
+```bash
+# 本机（有行情库的那台）
+python scripts/export_slice.py --size 800 --start 20220101 --gzip
+gh release create data-20260918 data/market_slice.db.gz \
+    --title "行情切片 20260918" --notes "800 只 × 2022-2026"
+
+# 云端会话
+python scripts/fetch_slice.py
+```
+
+导出的切片**只含行情表**（daily_bar / oamv_daily / xdxr / security /
+security_name_hist），与 MCP 服务的白名单一致；position / trade_log /
+account / watchlist / blacklist 一行都不会带出去，导出后有自查，
+不通过会直接删掉产物。
+
+### 为什么不用局域网 MCP
+
+`zhixing_quant/mcp_server.py` 在局域网内好用，但云端会话连不上，实测：
+
+| 路径 | 结果 |
+|---|---|
+| 直连 `10.9.2.237:8765` | 超时。RFC1918 私有地址，云端容器无路由；且 `10.0.0.0/8` 在代理 noProxy 名单里，会被当直连 |
+| Cloudflare Tunnel / ngrok 公网隧道 | 网关对 CONNECT 返回 **403（策略拒绝）**，出网是白名单 |
+| GitHub（api / raw / objects） | **通** |
+
+所以数据只能走 GitHub。MCP 服务本身没问题，留着给局域网内的客户端用。
+
 ## 验证
 
 ```bash

@@ -56,8 +56,11 @@ def compute_metrics(
     std_daily = variance ** 0.5
     sharpe = ((avg_daily - daily_rf) / std_daily * (252 ** 0.5)) if std_daily > 0 else 0.0
 
-    # Sortino (downside deviation)
-    downside = [min(0.0, r - avg_daily) ** 2 for r in daily_returns]
+    # Sortino：下行波动的基准应该是**目标收益**（这里取无风险利率），
+    # 不是样本均值。原实现用 min(0, r - avg_daily)，等于「低于自己平均水平」
+    # 都算下行——那是均值半方差，不是 Sortino。后果是策略越稳定（均值附近
+    # 波动小）分母越小、Sortino 越虚高，恰好在最该保守的时候给了高分。
+    downside = [min(0.0, r - daily_rf) ** 2 for r in daily_returns]
     down_std = (sum(downside) / len(downside)) ** 0.5 if downside else 0.0
     sortino = ((avg_daily - daily_rf) / down_std * (252 ** 0.5)) if down_std > 0 else 0.0
 

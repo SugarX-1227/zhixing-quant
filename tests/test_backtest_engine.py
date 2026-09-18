@@ -182,3 +182,32 @@ def test_no_regime_map_behaves_as_before():
     df = _frame([(10, 10.5, 9.5, 10)] * 12, sig_idx=[2])   # 留足持有满5日后的平仓日
     res = BacktestEngine(CFG).run({"600000": df}, signal_col="sig")
     assert len(res.trades) == 1                          # 不传 regime 时行为不变
+
+
+def test_chinext_limit_was_ten_percent_before_the_2020_reform():
+    """创业板 2020-08-24 起才从 10% 放宽到 20%。
+
+    一刀切按 20% 的话，2020-08 之前的创业板一字板会被判成「没涨停」，
+    从而虚构出一批实盘根本买不进的成交。
+    """
+    eng = BacktestEngine(CFG)
+    assert eng._limit_pct("300750", pd.Timestamp("2020-08-21")) == 0.10
+    assert eng._limit_pct("300750", pd.Timestamp("2020-08-24")) == 0.20
+    assert eng._limit_pct("301001", pd.Timestamp("2019-01-01")) == 0.10
+
+
+def test_star_market_is_always_twenty_percent():
+    """科创板 2019 年开市即 20%，没有这个时间点。"""
+    eng = BacktestEngine(CFG)
+    assert eng._limit_pct("688001", pd.Timestamp("2019-07-22")) == 0.20
+
+
+def test_main_board_is_unaffected_by_the_reform_date():
+    eng = BacktestEngine(CFG)
+    for d in ("2019-01-01", "2026-01-01"):
+        assert eng._limit_pct("600000", pd.Timestamp(d)) == 0.10
+
+
+def test_limit_pct_without_a_date_assumes_current_rules():
+    """不传日期时按现行规则，保持既有调用方的行为不变。"""
+    assert BacktestEngine(CFG)._limit_pct("300750") == 0.20

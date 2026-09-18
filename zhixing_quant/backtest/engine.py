@@ -469,7 +469,7 @@ class BacktestEngine:
         if i == 0:
             return False
         prev_close = item["close"][i - 1]
-        limit = self._limit_pct(code)
+        limit = self._limit_pct(code, date)
         o, h, low = item["open"][i], item["high"][i], item["low"][i]
         return (
             abs(o - h) < 1e-6 and abs(o - low) < 1e-6
@@ -482,17 +482,24 @@ class BacktestEngine:
         if i == 0:
             return False
         prev_close = item["close"][i - 1]
-        limit = self._limit_pct(code)
+        limit = self._limit_pct(code, date)
         o, h, low = item["open"][i], item["high"][i], item["low"][i]
         return (
             abs(o - h) < 1e-6 and abs(o - low) < 1e-6
             and o <= prev_close * (1 - limit) + 0.011
         )
 
-    def _limit_pct(self, code: str) -> float:
+    # 创业板注册制改革日：2020-08-24 起涨跌停由 10% 放宽到 20%。
+    # 跨这个时点回测时按 20% 一刀切，2020-08 之前的创业板一字板会被
+    # 判成「没涨停」，从而虚构出一批实盘根本买不进的成交。
+    CHINEXT_20PCT_FROM = pd.Timestamp("2020-08-24")
+
+    def _limit_pct(self, code: str, date=None) -> float:
         bt = self.cfg.get("backtest", {})
         code = str(code).zfill(6)
         if code.startswith(("300", "301")):
+            if date is not None and pd.Timestamp(date) < self.CHINEXT_20PCT_FROM:
+                return float(bt.get("limit_up_pct", 0.10))
             return float(bt.get("limit_up_chi_next", 0.20))
         if code.startswith("688"):
             return float(bt.get("limit_up_star", 0.20))

@@ -28,7 +28,7 @@ from zhixing_quant.ui.theme import (                    # noqa: E402
 inject_css()
 
 BOOKS = {"swing": "波段账户", "scalp": "超短账户"}
-PAGE_ORDER = ["今日", "持仓", "战法", "回测", "因子", "个股", "数据"]
+PAGE_ORDER = ["今日", "持仓", "战法", "回测", "校准", "因子", "个股", "数据"]
 
 
 @st.cache_resource
@@ -955,8 +955,169 @@ def page_factors(cfg, book):
         f"{k} {v:.0%}" for k, v in res["coverage"].head(3).items()))
 
 
+# 常用的可调参数：路径 -> (中文名, 建议取值)
+CALIB_PARAMS = {
+    "exits.{s}.stop.kind": ("止损方式", ["entry_low", "pct", "atr"]),
+    "exits.{s}.stop.pct": ("止损百分比", [0.04, 0.06, 0.08, 0.10]),
+    "exits.{s}.stop.atr_mult": ("止损ATR倍数", [1.5, 2.0, 2.5, 3.0]),
+    "exits.{s}.trailing.kind": ("移动止损", ["none", "pct", "chandelier",
+                                            "white_line", "yellow_line"]),
+    "exits.{s}.trailing.pct": ("移动止损回撤", [0.06, 0.10, 0.15]),
+    "exits.{s}.trailing.activate_profit": ("移动止损启用浮盈", [0.0, 0.05, 0.10]),
+    "exits.{s}.take_profit.pct": ("止盈百分比", [0.10, 0.15, 0.25]),
+    "exits.{s}.time_stop.max_holding_days": ("最长持有", [0, 5, 10, 20, 30]),
+    "exits.{s}.time_stop.no_progress_days": ("N日不拉升", [0, 2, 3, 5]),
+    "exits.{s}.profit_to_loss": ("盈转亏门槛", [0.0, 0.02, 0.05]),
+    "entries.{s}.base_pct": ("底仓比例", [0.10, 0.15, 0.20]),
+    "entries.{s}.max_addons": ("最多加仓次数", [0, 2, 4]),
+}
+
+
+def page_calibrate(cfg, book):
+    """参数校准：样本内外切分 / 网格扫描 / 滚动前进。核心是防过拟合。"""
+    from zhixing_quant.backtest.calibrate import OBJECTIVES, grid_combos
+    from zhixing_quant.backtest.runner import BACKTESTABLE
+    from zhixing_quant.data.universe import BOARDS, UniverseSpec
+
+    C.page_head("校准", "在同一段历史上反复试参数、留下最好看的那组，就是过拟合")
+    st.caption("判断一组参数能不能用，三件事缺一不可："
+               "**① 样本外没有大幅衰减　② 参数曲面是平的不是尖的　③ 交易笔数够**。"
+               "只要一条不满足就不该上实盘，哪怕回测收益再好看。")
+
+    strategies = _strategies()
+    names = [n for n in strategies if n in BACKTESTABLE]
+    c = st.columns([1.6, 1.3, 1.3, 1.2, 1.2])
+    name = c[0].selectbox("战法", names, key="cal_strat",
+                          format_func=lambda n: strategies[n]["label"])
+    start = c[1].date_input("开始", value=datetime.now() - timedelta(days=1000),
+                            key="cal_start")
+    end = c[2].date_input("结束", value=datetime.now(), key="cal_end")
+    oos = c[3].slider("样本外占比", 0.1, 0.5, 0.3, 0.05, key="cal_oos")
+    obj = c[4].selectbox("排序目标", list(OBJECTIVES), key="cal_obj",
+                         format_func=lambda k: OBJECTIVES[k])
+
+    u = st.columns([1.2, 1.2, 1.2, 2])
+    size = u[0].number_input("股票池", 20, 800, 150, 10, key="cal_size")
+    min_amt = u[1].number_input("成交额下限(亿)", 0.0, 50.0, 1.0, 0.5, key="cal_amt")
+    top_n = u[2].number_input("样本外验证前N组", 1, 10, 3, key="cal_topn")
+    spec = UniverseSpec(boards=("MAIN", "CHINEXT"), size=int(size),
+                        min_amount=min_amt * 1e8, exclude_st=True,
+                        min_listed_bars=120)
+
+    tabs = st.tabs(["网格扫描", "滚动前进验证"])
+
+    # ---- 网格扫描 ----
+    with tabs[0]:
+        paths = {k.format(s=name): v for k, v in CALIB_PARAMS.items()}
+        picked = st.multiselect(
+            "要扫哪些参数（选 1-3 个，越多越容易撞出噪声）",
+            list(paths), key="cal_grid_pick",
+            format_func=lambda p: f"{paths[p][0]}　{p}")
+        grid = {}
+        if picked:
+            cols = st.columns(min(len(picked), 3))
+            for i, path in enumerate(picked):
+                label, options = paths[path]
+                with cols[i % len(cols)]:
+                    vals = st.multiselect(label, options, default=options,
+                                          key=f"cal_v_{path}")
+                    if vals:
+                        grid[path] = vals
+        n = len(grid_combos(grid)) if grid else 0
+        if grid:
+            st.caption(f"{n} 组参数 × (样本内 + 前 {top_n} 组的样本外) "
+                       f"≈ {n + int(top_n)} 次回测。有效配置相同的组会自动复用。")
+        if st.button("开始扫描", type="primary", key="cal_sweep",
+                     disabled=not grid):
+            from zhixing_quant.backtest.calibrate import sweep
+            bar = st.progress(0.0, text="准备...")
+            try:
+                res = sweep(cfg, name, grid, start.strftime("%Y%m%d"),
+                            end.strftime("%Y%m%d"), spec=spec,
+                            oos_frac=float(oos), top_n=int(top_n),
+                            objective_kind=obj,
+                            progress=lambda d, t, s2: bar.progress(
+                                min(d / max(t, 1), 1.0), text=f"{d}/{t} {s2}"))
+            except Exception as exc:
+                bar.empty()
+                st.error(f"扫描失败：{exc}")
+            else:
+                bar.empty()
+                st.session_state["cal_sweep_res"] = (res, list(grid))
+
+        got = st.session_state.get("cal_sweep_res")
+        if got:
+            res, gkeys = got
+            for w in res.warnings:
+                (st.error if "⚠️" in w or "不该上实盘" in w else st.info)(w)
+            if not res.table.empty:
+                st.dataframe(res.table, use_container_width=True, hide_index=True)
+                from zhixing_quant.backtest.calibrate import plateau_score
+                flat = []
+                for path in gkeys:
+                    col = ".".join(path.split(".")[-2:])
+                    sc = plateau_score(res.table, col)
+                    if sc:
+                        flat.append({"参数": col, "平坦度": round(sc, 3),
+                                     "判定": "平台，稳健" if sc >= 0.5
+                                             else "尖峰，换段数据就会塌"})
+                if flat:
+                    st.markdown("**参数平坦度**　"
+                                "稳健的参数应该有平台而不是尖峰——最优点旁边"
+                                "的取值也得差不多好")
+                    st.dataframe(pd.DataFrame(flat), use_container_width=True,
+                                 hide_index=True)
+
+    # ---- 滚动前进 ----
+    with tabs[1]:
+        st.caption("每段只用**之前**的数据定参数，在后面那段上交易。"
+                   "把各测试段串起来，就是「如果我每季度重调一次参」的真实曲线——"
+                   "这是最接近实盘的验证方式。")
+        w = st.columns([1.2, 1.2, 3])
+        train_m = w[0].number_input("训练(月)", 3, 36, 12, key="cal_train")
+        test_m = w[1].number_input("测试(月)", 1, 12, 3, key="cal_test")
+        wpaths = {k.format(s=name): v for k, v in CALIB_PARAMS.items()}
+        wpick = st.multiselect("要滚动优化的参数（建议只选 1 个）",
+                               list(wpaths), key="cal_wf_pick",
+                               format_func=lambda p: f"{wpaths[p][0]}　{p}")
+        wgrid = {}
+        for path in wpick:
+            label, options = wpaths[path]
+            vals = st.multiselect(label, options, default=options[:3],
+                                  key=f"cal_wv_{path}")
+            if vals:
+                wgrid[path] = vals
+        if st.button("开始滚动验证", type="primary", key="cal_wf",
+                     disabled=not wgrid):
+            from zhixing_quant.backtest.calibrate import (walk_forward,
+                                                          walk_forward_summary)
+            bar = st.progress(0.0, text="准备...")
+            try:
+                wf = walk_forward(cfg, name, wgrid, start.strftime("%Y%m%d"),
+                                  end.strftime("%Y%m%d"), spec=spec,
+                                  train_months=int(train_m),
+                                  test_months=int(test_m), objective_kind=obj,
+                                  progress=lambda d, t, s2: bar.progress(
+                                      min(d / max(t, 1), 1.0),
+                                      text=f"{d}/{t} {s2}"))
+            except Exception as exc:
+                bar.empty()
+                st.error(f"滚动验证失败：{exc}")
+            else:
+                bar.empty()
+                st.session_state["cal_wf_res"] = (wf, walk_forward_summary(wf))
+
+        gotw = st.session_state.get("cal_wf_res")
+        if gotw:
+            wf, lines = gotw
+            for line in lines:
+                (st.error if "不要拿去实盘" in line or "噪声" in line
+                 else st.info)(line)
+            st.dataframe(wf, use_container_width=True, hide_index=True)
+
+
 PAGES = {"今日": page_today, "持仓": page_positions, "战法": page_strategies,
-         "因子": page_factors,
+         "校准": page_calibrate, "因子": page_factors,
          "回测": page_backtest, "个股": page_chart, "数据": page_data}
 
 

@@ -317,14 +317,33 @@ def test_runner_merges_required_steps_into_the_pipeline():
 # 随仓配置是否真的落到了规划书的口径上
 # ---------------------------------------------------------------------------
 
-def test_shipped_b2_has_the_two_day_no_progress_rule():
-    """规划书 4.3.2 / 6.3：B2 最多休整 1 天，2 日内不大幅拉升就全清。
-    改动前这里是 max_holding_days: 0，完全不限。"""
+def test_shipped_b2_disabled_the_two_rules_the_data_rejected():
+    """B2 的「2 日不拉升」和「低低走人」已按实测关闭。
+
+    这两条原本是按规划书 4.3.2 / 6.3 加上去的，但拿真实行情
+    （800 只 / 2022-08~2026-09）跑消融，它们是**亏钱**的：
+
+        关掉 低低走人      总收益 +26.4%
+        关掉 2日不拉升     总收益 +5.9%
+
+    并且样本内外都改善（样本内 -37.6%→-33.2%，样本外 +11.6%→+46.4%），
+    过了「删规则必须过样本外」这一关，才动的配置。
+
+    规划书是**假设**，实测是**证据**。这条测试锁的是证据，不是假设——
+    要改回去，先拿出新的样本外证据。
+    """
     from zhixing_quant.config import load_config
 
-    ts = spec_from_config(load_config(), "b2").time_stop
-    assert ts.no_progress_days == 2
-    assert ts.min_progress > 0
+    spec = spec_from_config(load_config(), "b2")
+    assert spec.time_stop.no_progress_days == 0, "2日不拉升实测亏钱，应保持关闭"
+    assert spec.close_below_prev_low == 0.0, "低低走人实测吃掉 26 个百分点，应保持关闭"
+
+
+def test_shipped_b1_still_keeps_the_low_low_rule():
+    """B1 的「低低走人」没动——消融只在 B2 上做过，别把结论外推。"""
+    from zhixing_quant.config import load_config
+
+    assert spec_from_config(load_config(), "b1").close_below_prev_low > 0
 
 
 def test_shipped_b2_reduces_by_half_on_s1_and_distribution():

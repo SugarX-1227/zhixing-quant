@@ -149,8 +149,10 @@ def test_active_switches_reflect_the_shipped_config():
     cfg = load_config()
     b2 = {sw.key for sw in active_switches(cfg, "b2")}
     # 随仓 b2 配了这些，消融必须都认得
-    assert {"stop", "take_profit", "break_yellow_line", "no_progress",
+    assert {"stop", "take_profit", "break_yellow_line", "trailing",
             "defense_ladder"} <= b2
+    # 实测亏钱、已关闭的两条不该再出现在消融列表里——跑它们等于白跑
+    assert "no_progress" not in b2
 
 
 def test_inactive_rules_are_not_offered_for_ablation():

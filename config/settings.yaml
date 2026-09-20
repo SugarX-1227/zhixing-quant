@@ -22,11 +22,18 @@ capital:
   max_position_value: 25000
 
 universe:
-  min_daily_amount: 100000000    # 成交额下限，1 亿
+  # 成交额下限。0 = 不设门槛（2026-09 使用者决定）。
+  # 代价要知道：回测不处理停牌和一字板，日成交额很小的票在回测里
+  # 能成交、实盘未必能，这类标的的收益会被高估。
+  min_daily_amount: 0
   exclude_st: true
   exclude_new_stock_days: 60     # K线数少于此值视为次新，剔除
   exclude_boards: []             # 可填 STAR / CHINEXT / BSE，INDEX 永远排除
+  # 每日候选列表显示前几只。只管展示，不影响回测可选范围。
   max_candidates: 10
+  # 回测股票池上限，0 = 不截断。和 max_candidates 是两回事，
+  # 以前共用一个键，把回测池压成了每季度 10 只。
+  pool_size: 0
 
 execution:
   signal_confirm: close

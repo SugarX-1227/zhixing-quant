@@ -163,12 +163,26 @@ def build_universe(
 
 
 def spec_from_config(cfg: dict) -> UniverseSpec:
+    """从配置读建池条件。
+
+    池子大小读 `universe.pool_size`，**不读 `max_candidates`**。
+    这两个是不同的东西，以前共用一个键：
+
+    - `max_candidates` 是每日候选列表显示前几只（scanner/_core.py），
+    - `pool_size` 是回测可选标的池的上限。
+
+    共用的后果是回测池被压成每季度 10 只：实测 2022-07-31 那天，
+    不截断能进池 614 只，配置默认只有 10 只，17 个季度并起来才 66 只，
+    全样本 68 笔成交——低于样本量下限，出场规则、入场条件、因子权重
+    在这种池子上比出来的差异全是噪声。app.py 的因子页当时是靠
+    `max_candidates = 9999` 硬绕过去的。
+    """
     u = cfg.get("universe", {}) or {}
     exclude = set(u.get("exclude_boards", []) or [])
     boards = tuple(b for b in DEFAULT_BOARDS if b not in exclude) or DEFAULT_BOARDS
     return UniverseSpec(
         boards=boards,
-        size=int(u.get("max_candidates", 0)) or None,
+        size=int(u.get("pool_size", 0) or 0) or None,
         min_amount=float(u.get("min_daily_amount", 0) or 0),
         exclude_st=bool(u.get("exclude_st", True)),
         min_listed_bars=int(u.get("exclude_new_stock_days", 0) or 0),

@@ -80,11 +80,29 @@ def test_boards_cover_all_board_codes():
 
 
 def test_spec_from_config_respects_exclude_boards():
-    cfg = {"universe": {"exclude_boards": ["CHINEXT"], "max_candidates": 50,
+    cfg = {"universe": {"exclude_boards": ["CHINEXT"], "pool_size": 50,
                         "min_daily_amount": 1e8}}
     spec = spec_from_config(cfg)
     assert "CHINEXT" not in spec.boards
     assert spec.size == 50
+
+
+def test_pool_size_is_not_max_candidates():
+    """max_candidates 只管每日候选列表长度，不能再截断回测股票池。
+
+    这条接线错过一次：两个键共用，回测池被压成每季度 10 只，
+    全样本 68 笔成交，任何规则对比出来的差异都是噪声。
+    """
+    cfg = {"universe": {"max_candidates": 10}}
+    assert spec_from_config(cfg).size is None
+
+    cfg = {"universe": {"max_candidates": 10, "pool_size": 300}}
+    assert spec_from_config(cfg).size == 300
+
+
+def test_pool_size_zero_means_no_truncation():
+    assert spec_from_config({"universe": {"pool_size": 0}}).size is None
+    assert spec_from_config({"universe": {}}).size is None
 
 
 def test_rebalance_dates_quarterly():

@@ -74,6 +74,14 @@ NEVER_EXPORT = ("position", "trade_log", "account", "watchlist", "blacklist",
 DEFAULT_EXTRA = ("sh000300", "sh000905", "sh000001", "sz399001")
 
 
+# ⚠️ 选择偏差警告（2026-09-20 实测）
+# pick_codes 按**某一个近期日期**的成交额降序取前 N 只。能在今天挤进成交额
+# 前列的股票，本身就是过去几年跑赢的那批，拿这批票回测过去等于提前知道了
+# 答案。同一份代码同一段时间：800 只切片上 B2 总收益 +115.3%，
+# 全量 5213 只上 −28.0%，符号都是反的。
+# 所以切片只能用来验证代码跑不跑得通，**任何策略结论都必须在
+# data-20260918-all（全量）上重跑**。
+
 def pick_codes(src: sqlite3.Connection, size: int, min_amount: float,
                as_of: Optional[int]) -> List[str]:
     """按 as_of 当日成交额取前 N 只。as_of 缺省用库里**最后一个完整交易日**。

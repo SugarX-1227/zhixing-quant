@@ -55,6 +55,11 @@ def _step_brick(df, cfg):
     return add_brick_indicators(df, cfg)
 
 
+def _step_b2_patterns(df, cfg):
+    from zhixing_quant.indicators.b2_patterns import add_b2_pattern_indicators
+    return add_b2_pattern_indicators(df, cfg)
+
+
 def _step_b1(df, cfg):
     from zhixing_quant.indicators.b1 import add_b1_indicators
     return add_b1_indicators(df, cfg)
@@ -139,6 +144,7 @@ STEPS: Dict[str, Callable] = {
     "key_kline": _step_key_kline,
     "sb1": _step_sb1,
     "b3": _step_b3,
+    "b2_patterns": _step_b2_patterns,
     "violent_k": _step_violent_k,
     "sell_s": _step_sell_s,
     "distribution": _step_distribution,

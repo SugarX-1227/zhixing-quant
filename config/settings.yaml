@@ -94,6 +94,18 @@ b2:
   b1_within_days: 0        # 当日之前 N 个交易日内须出现过 B1，0=关闭
   body_ratio_min: 0.0      # 实体/(最高-最低) 下限，0=关闭。有符号，阴线自动出局
 
+# 三大 B2 子形态（规划书 4.3.3 / 6.3），见 indicators/b2_patterns.py。
+# 规划书只有一行定义，以下阈值是按字面最直接读法定的口径，不是手册原值。
+b2_patterns:
+  long_pct: 4.0            # 长阳涨幅下限（%）
+  parallel_pct_tol: 3.0    # 平行重炮：两根长阳涨幅相差不超过几个百分点
+  rebuild_window: 10       # 灾后重建：击穿与回踩须在之前几日内
+  heavy_lookback: 60       # 灾后重建：「重成交区」= 之前几日里最大量那天的收盘价
+  rebuild_vol_mult: 2.0    # 灾后重建：倍量倍数
+  platform_days: 10        # 跃跃欲试：横盘天数
+  platform_range: 0.05     # 跃跃欲试：平台收盘价区间上限
+  min_tests: 2             # 跃跃欲试：平台内至少几次冲高回落（当日为第 N+1 次）
+
 macd:
   fast: 12
   slow: 26

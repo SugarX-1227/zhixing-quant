@@ -26,6 +26,10 @@
     python scripts/signal_event_study.py                  # B2
     python scripts/signal_event_study.py --strategy b1
     python scripts/signal_event_study.py --strategy brick --all-regimes
+    python scripts/signal_event_study.py --steps b2_patterns \
+        --signal sig_b2_parallel,sig_b2_rebuild,sig_b2_eager   # 任意信号列，一次加载测多个
+    python scripts/signal_event_study.py --steps b2,b2_patterns \
+        --signal "sig_b2&sig_b2_eager"                         # & 表示同一天同时命中
 
 必须用全量数据（data-20260918-all），切片有选择偏差。全量一次约 4 分钟。
 """
@@ -58,10 +62,8 @@ def log(*a) -> None:
     print(*a, flush=True)
 
 
-def build_events(cfg: dict, strategy: str, start: str, end: str) -> pd.DataFrame:
-    """全市场股票日：信号、能否买进、各持有期收益、当日区间、减同日均值后的超额。"""
-    sig_col = BACKTESTABLE[strategy]
-    steps = PIPELINES.get(strategy, [strategy])
+def build_events(cfg: dict, signals: list, steps: list, start: str, end: str) -> pd.DataFrame:
+    """全市场股票日：各信号列、能否买进、各持有期收益、当日区间、减同日均值后的超额。"""
     _, codes, _ = collect_universe_pools(cfg, start, end)
     warm = (pd.Timestamp(start) - pd.Timedelta(days=400)).strftime("%Y%m%d")
     raw = load_daily_many(codes, start_date=warm, end_date=end)
@@ -75,8 +77,12 @@ def build_events(cfg: dict, strategy: str, start: str, end: str) -> pd.DataFrame
         o1 = o.shift(-1)
         blocked = ((o1 == d["high"].shift(-1)) & (o1 == d["low"].shift(-1))
                    & (o1 / c - 1 > 0.09))
-        row = pd.DataFrame({"sig": d[sig_col].fillna(False).astype(bool),
-                            "fill": ~blocked & o1.notna()}, index=d.index)
+        row = pd.DataFrame({"fill": ~blocked & o1.notna()}, index=d.index)
+        for col in signals:
+            hit = pd.Series(True, index=d.index)
+            for part in col.split("&"):
+                hit &= d[part].fillna(False).astype(bool)
+            row[col] = hit
         for h in HORIZONS:
             row[f"oc{h}"] = c.shift(-h) / o1 - 1.0      # T+1 开盘买
             row[f"cc{h}"] = c.shift(-h) / c - 1.0       # T 收盘买（上限）
@@ -109,6 +115,10 @@ def main() -> None:
     warnings.filterwarnings("ignore")
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--strategy", default="b2", choices=sorted(BACKTESTABLE))
+    ap.add_argument("--signal", default="",
+                    help="信号列，逗号分隔可测多个；缺省取战法的信号列")
+    ap.add_argument("--steps", default="",
+                    help="指标流水线步骤，逗号分隔；缺省取战法的流水线")
     ap.add_argument("--start", default="20220801")
     ap.add_argument("--end", default="20260917")
     ap.add_argument("--oos-start", default="20250401")
@@ -118,11 +128,23 @@ def main() -> None:
 
     cfg = load_config()
     t0 = time.time()
-    ev = build_events(cfg, args.strategy, args.start, args.end)
-    hit = ev.sig if args.all_regimes else ev.sig & ev.bull
+    signals = [x for x in args.signal.split(",") if x] or [BACKTESTABLE[args.strategy]]
+    steps = ([x for x in args.steps.split(",") if x]
+             or PIPELINES.get(args.strategy, [args.strategy]))
+    ev = build_events(cfg, signals, steps, args.start, args.end)
+    log(f"股票日 {len(ev):,}  [{time.time()-t0:.0f}s]")
+    for col in signals:
+        report(ev, col, args)
+    log(f"\n耗时 {time.time()-t0:.0f}s")
+
+
+def report(ev: pd.DataFrame, col: str, args) -> None:
+    sig = ev[col]
+    hit = sig if args.all_regimes else sig & ev.bull
     scope = "全部区间" if args.all_regimes else "多头区间"
-    log(f"{args.strategy}：股票日 {len(ev):,}，命中 {int(ev.sig.sum()):,}，"
-        f"{scope}命中 {int(hit.sum()):,}  [{time.time()-t0:.0f}s]")
+    years = (ev["date"].max() - ev["date"].min()).days / 365.25
+    log(f"\n################ {col}：命中 {int(sig.sum()):,}（每年约 {sig.sum() / years:,.0f}），"
+        f"{scope}命中 {int(hit.sum()):,}")
 
     fmt = lambda rows: pd.DataFrame(rows).round(4).to_string(index=False)  # noqa: E731
     log(f"\n=== 各持有期（{scope}，T+1 开盘买，超额 = 减同日全市场等权）===")
@@ -133,8 +155,8 @@ def main() -> None:
     log(fmt([stat(ev, hit, "cc5", "T 收盘买"), stat(ev, hit, "oc5", "T+1 开盘买")]))
 
     log("\n=== 择时：多头 vs 空头，5 日 ===")
-    log(fmt([stat(ev, ev.sig & ev.bull, "oc5", "多头"),
-             stat(ev, ev.sig & ~ev.bull, "oc5", "空头")]))
+    log(fmt([stat(ev, sig & ev.bull, "oc5", "多头"),
+             stat(ev, sig & ~ev.bull, "oc5", "空头")]))
 
     log("\n=== 稳定性：逐年 / 样本内外，5 日 ===")
     yr = ev["date"].dt.year
@@ -143,7 +165,6 @@ def main() -> None:
     rows += [stat(ev, hit & (ev["date"] < oos), "oc5", f"样本内 <{args.oos_start}"),
              stat(ev, hit & (ev["date"] >= oos), "oc5", f"样本外 ≥{args.oos_start}")]
     log(fmt(rows))
-    log(f"\n耗时 {time.time()-t0:.0f}s")
 
 
 if __name__ == "__main__":

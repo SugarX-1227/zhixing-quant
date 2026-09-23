@@ -553,3 +553,70 @@ def test_stability_report_labels_each_case():
     assert verdicts["stable"] == "稳定"
     assert "幻觉" in verdicts["mirage"]
     assert verdicts["noise"] == "始终不显著"
+
+
+# ---------------------------------------------------------------------------
+# 战法命中人群上的条件 IC
+# ---------------------------------------------------------------------------
+
+def _with_signal(data: dict, hit_codes: set) -> dict:
+    out = {}
+    for code, df in data.items():
+        d = df.copy()
+        d["sig_x"] = code in hit_codes
+        out[code] = d
+    return out
+
+
+def test_strategy_population_keeps_only_hits():
+    from zhixing_quant.factors.evaluate import strategy_population
+    data = _with_signal(_market(6, 40), {"600001", "600003"})
+    pop = strategy_population(data, "sig_x")
+    assert set(pop.index.get_level_values("code")) == {"600001", "600003"}
+    assert bool(pop.all())
+    assert len(pop) == 2 * 40
+
+
+def test_strategy_population_drops_non_bull_days():
+    from zhixing_quant.factors.evaluate import strategy_population
+    data = _with_signal(_market(3, 20), {"600000"})
+    dates = data["600000"].index
+    regime = pd.Series(["BULL"] * 10 + ["BEAR"] * 10, index=dates)
+    pop = strategy_population(data, "sig_x", regime=regime)
+    assert set(pop.index.get_level_values("date")) == set(dates[:10])
+
+
+def test_evaluate_factors_population_matches_manual_mask():
+    """主入口：给了人群，IC 必须和「先筛面板再算 IC」逐位相同。"""
+    from zhixing_quant.factors.evaluate import forward_returns, strategy_population
+    hits = {f"{600000 + i:06d}" for i in range(0, 30, 2)}      # 一半的票
+    data = _with_signal(_market(30, 200), hits)
+    pop = strategy_population(data, "sig_x")
+
+    res = evaluate_factors(data, ["mom_20"], horizon=5, population=pop)
+    panel = build_panel(data, ["mom_20"])
+    manual = factor_ic(panel[pop.reindex(panel.index, fill_value=False).to_numpy(bool)],
+                       forward_returns(data, 5))
+    pd.testing.assert_frame_equal(res["ic"], manual)
+    assert any("人群" in w for w in res["warnings"])
+
+    # 人群确实改变了结果：全市场 IC 和人群 IC 不是同一个东西
+    full = evaluate_factors(data, ["mom_20"], horizon=5)
+    assert not full["ic"]["mom_20"].equals(res["ic"]["mom_20"])
+
+
+def test_evaluate_factors_empty_population_does_not_crash():
+    from zhixing_quant.factors.evaluate import strategy_population
+    data = _with_signal(_market(10, 100), set())
+    res = evaluate_factors(data, ["mom_20"], population=strategy_population(data, "sig_x"))
+    assert res["summary"].empty
+    assert res["warnings"]
+
+
+def test_regime_by_close_indexes_by_trade_date():
+    from zhixing_quant.timing.active_value import regime_by_close
+    states = pd.DataFrame({"trade_date": [20240102, 20240103],
+                           "regime": ["BEAR", "BULL"]})
+    s = regime_by_close(states=states)
+    assert s[pd.Timestamp("2024-01-03")] == "BULL"
+    assert s[pd.Timestamp("2024-01-02")] == "BEAR"

@@ -794,8 +794,24 @@ def page_factors(cfg, book):
     start = u[0].date_input("开始", value=datetime.now() - timedelta(days=540),
                             key="fac_start")
     end = u[1].date_input("结束", value=datetime.now(), key="fac_end")
-    size = u[2].number_input("股票池大小", 20, 800, 200, 20, key="fac_size")
+    size = u[2].number_input("股票池大小", 20, 6000, 200, 100, key="fac_size")
     min_amt = u[3].number_input("成交额下限(亿)", 0.0, 50.0, 1.0, 0.5, key="fac_amt")
+
+    from zhixing_quant.backtest.runner import BACKTESTABLE
+    strategies = _strategies()
+    pop_opts = ["all"] + [k for k in BACKTESTABLE if k in strategies]
+    v = st.columns([2, 1.4, 3.6])
+    pop_key = v[0].selectbox(
+        "检验人群", pop_opts, index=0, key="fac_pop",
+        format_func=lambda k: "全市场" if k == "all" else f"{strategies[k]['label']} 命中标的")
+    bull_only = v[1].checkbox("只看多头区间", value=True, key="fac_bull",
+                              disabled=pop_key == "all",
+                              help="空头区间引擎禁止开仓，那天的命中根本不会被排序")
+    v[2].caption("给战法配排序权重，要看**命中人群**的 IC：排序只作用于当日命中"
+                 "信号的那十几只，因子规律和全市场不同。全量实测 B2：`amount_cv` "
+                 "全市场最强、命中人群里失效；`vol_ratio` 在命中人群里符号翻转。"
+                 "选命中人群时股票池要放到全市场（6000 只、成交额下限 0），"
+                 "否则每天命中不足 10 只，算不出 IC；全市场约需 5 分钟。")
 
     st.caption("IC = 当日因子排序与未来 N 日收益排序的秩相关。"
                "|IC均值| > 0.03 算有信号，|ICIR| > 0.3 算稳定，"
@@ -820,19 +836,29 @@ def page_factors(cfg, book):
             raw = load_daily_many(uni.codes, start_date=warm,
                                   end_date=end.strftime("%Y%m%d"))
             steps = FA.required_steps(picked)
+            if pop_key != "all":
+                from zhixing_quant.indicators.pipeline import PIPELINES
+                steps = list(dict.fromkeys(steps + PIPELINES.get(pop_key, [pop_key])))
             bar.progress(0.5, text=f"计算指标（{', '.join(steps) or '无'}）...")
             data = {c2: run_steps(df, cfg, steps).df
                     for c2, df in raw.items() if df is not None and len(df) > 150}
+            population = None
+            if pop_key != "all":
+                from zhixing_quant.factors.evaluate import strategy_population
+                from zhixing_quant.timing.active_value import regime_by_close
+                regime = regime_by_close(cfg) if bull_only else None
+                population = strategy_population(data, BACKTESTABLE[pop_key], regime)
             bar.progress(0.8, text="计算 IC 与分层收益...")
             res = evaluate_factors(data, picked, horizon=int(horizon), q=int(quant),
                                    start=start.strftime("%Y%m%d"),
-                                   end=end.strftime("%Y%m%d"))
+                                   end=end.strftime("%Y%m%d"),
+                                   population=population)
         except Exception as exc:
             bar.empty()
             st.error(f"检验失败：{exc}")
             return
         bar.empty()
-        st.session_state["fac"] = (res, len(data))
+        st.session_state["fac"] = (res, len(data), pop_key)
 
     got = st.session_state.get("fac")
     if got is None:
@@ -851,7 +877,7 @@ def page_factors(cfg, book):
                 st.caption("、".join(f"{k}×{v}" for k, v in meta["weights"].items()))
         return
 
-    res, n_loaded = got
+    res, n_loaded, got_pop = got
     for w in res["warnings"]:
         st.warning(w)
     st.caption(f"实际参与 {n_loaded} 只标的，{len(res['ic'])} 个交易日")
@@ -911,23 +937,30 @@ def page_factors(cfg, book):
                                     st.column_config.NumberColumn(format="%.3f")})
 
     # 按实测 IC 直接生成权重，替代拍脑袋
-    with st.expander("按实测 IC 生成权重（推荐，替代预设）", expanded=not flipped.empty):
+    with st.expander("按实测 IC 生成权重", expanded=False):
         from zhixing_quant.factors.evaluate import weights_as_yaml, weights_from_ic
 
+        if got_pop == "all":
+            st.warning("这组 IC 是在**全市场**上算的，不适合直接给战法排序——"
+                       "全量实测 B2 照这样配，样本外 -23.2%，手写预设 +9.7%。"
+                       "上面「检验人群」选对应战法的命中标的后再生成。")
         g = st.columns([1, 1, 1, 2])
         n_max = g[0].number_input("最多留几个因子", 2, 12, 6, key="wg_n",
                                   help="留太多等于在短样本上过拟合")
         min_t = g[1].number_input("显著性门槛 |t|", 1.0, 5.0, 2.0, 0.5, key="wg_t")
         flip = g[2].checkbox("允许反向使用", value=True, key="wg_flip",
                              help="关掉则直接剔除方向相反的因子，而不是反过来用")
-        target = g[3].selectbox("写给哪个战法", ["b1", "b2", "brick"], index=1,
+        targets = ["b1", "b2", "brick"]
+        target = g[3].selectbox("写给哪个战法", targets,
+                                index=targets.index(got_pop) if got_pop in targets else 1,
                                 key="wg_target")
         gen = weights_from_ic(summary, max_factors=int(n_max),
                               min_abs_t=float(min_t), allow_flip=bool(flip))
         st.code(weights_as_yaml(gen, target), language="yaml")
-        st.caption("粘进 `config/settings.yaml`。负权重表示该因子实测方向与声明"
-                   "相反，反着用。⚠️ 这是在**同一段样本**上拟合出来的权重，"
-                   "换个区间再跑一遍确认稳定了再上。")
+        st.caption("负权重表示该因子实测方向与声明相反，反着用。⚠️ 这是在**当前区间**"
+                   "上拟合出来的权重，区间只能是样本内：粘进 `settings.yaml` 后，"
+                   "在区间之后的一段数据上回测，没考过现有预设就不换。全量实测过一次"
+                   "条件 IC 权重，B2 样本外 -7.0%，仍输给预设的 +9.7%。")
 
     pick = st.selectbox("看哪个因子的分层收益", list(summary["因子"]),
                         format_func=lambda n: label_of.get(n, n))

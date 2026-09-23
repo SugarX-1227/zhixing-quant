@@ -85,6 +85,19 @@ def oamv_trigger_states(
     return out
 
 
+def regime_by_close(cfg: Optional[dict] = None,
+                    states: Optional[pd.DataFrame] = None) -> pd.Series:
+    """每个交易日**收盘后**所处的区间，按日期索引（DatetimeIndex）。
+
+    T 日收盘后的区间 = T+1 开盘时引擎看到的区间（见 regime_before）。
+    研究「T 日命中的信号会不会真的被买」时用它。
+    """
+    if states is None:
+        states = oamv_trigger_states(cfg)
+    return pd.Series(states["regime"].to_numpy(),
+                     index=pd.to_datetime(states["trade_date"].astype(str)))
+
+
 def regime_before(
     days: Iterable, states: Optional[pd.DataFrame] = None, cfg: Optional[dict] = None,
 ) -> Dict[str, str]:

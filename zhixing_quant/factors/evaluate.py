@@ -375,6 +375,43 @@ def monotonicity(qret: pd.DataFrame) -> float:
     return float((np.diff(v) > 0).mean())
 
 
+def strategy_population(data: Dict[str, pd.DataFrame], sig_col: str,
+                        regime: Optional[pd.Series] = None) -> pd.Series:
+    """战法命中人群：当日 `sig_col` 为 True 的 (date, code)。
+
+    排序只作用于命中信号的那十几只，因子在这个人群里的规律和全市场不同——
+    2026-09 全量实测 B2：`amount_cv` 全市场 ICIR +0.54、命中人群里 +0.01；
+    `vol_ratio` 全市场 -0.18、命中人群里 +0.20。拿全市场 IC 给战法配权重，
+    样本外 -23.2%，手写预设 +9.7%。
+
+    Args:
+        data: {code: 已算好战法指标的日线}，须含 sig_col。
+        sig_col: 信号列名，如 "sig_b2"。
+        regime: 可选，按收盘日索引的区间序列（值为 BULL/BEAR/NEUTRAL），
+            见 timing.active_value.regime_by_close。给了就只留 BULL——
+            空头区间引擎禁止开仓，那天的命中根本不会被排序。
+
+    Returns:
+        布尔 Series，索引 (date, code)，只含 True 的行。
+    """
+    parts = []
+    for code, df in data.items():
+        if df is None or df.empty or sig_col not in df.columns:
+            continue
+        s = df[sig_col].fillna(False).astype(bool)
+        if regime is not None:
+            s = s & (regime.reindex(df.index).to_numpy() == "BULL")
+        s = s[s]
+        if s.empty:
+            continue
+        parts.append(pd.Series(True, index=pd.MultiIndex.from_arrays(
+            [s.index, [code] * len(s)], names=["date", "code"])))
+    if not parts:
+        return pd.Series(dtype=bool, index=pd.MultiIndex.from_arrays(
+            [[], []], names=["date", "code"]))
+    return pd.concat(parts).sort_index()
+
+
 def evaluate_factors(
     data: Dict[str, pd.DataFrame],
     names: Sequence[str],
@@ -382,6 +419,7 @@ def evaluate_factors(
     q: int = 5,
     start: Optional[str] = None,
     end: Optional[str] = None,
+    population: Optional[pd.Series] = None,
 ) -> dict:
     """一次算完 IC 表和每个因子的分层收益。界面和脚本都用这个入口。
 
@@ -391,6 +429,9 @@ def evaluate_factors(
         horizon: 未来收益天数。
         q: 分层数。
         start / end: YYYYMMDD，限定评估区间。
+        population: 可选，只在这些 (date, code) 上算 IC 和分层，
+            通常来自 `strategy_population`。筛选发生在因子算完之后，
+            不会因为筛人群额外丢样本。
 
     Returns:
         {"ic": 逐日IC, "summary": 汇总表, "quantiles": {因子: 分层表},
@@ -418,6 +459,18 @@ def evaluate_factors(
                 "warnings": ["区间内没有可用数据。"]}
 
     panel = build_panel(sliced, list(names))
+    if population is not None:
+        keep = population.reindex(panel.index, fill_value=False).to_numpy(dtype=bool)
+        panel = panel[keep]
+        per_day = panel.groupby(level="date").size()
+        days = len(per_day)
+        warnings.append(
+            f"只在指定人群上评估：{len(panel):,} 个样本、{days} 个交易日，"
+            f"每天中位 {per_day.median() if days else 0:.0f} 只，"
+            f"其中 {int((per_day < 10).sum())} 天不足 10 只、不计 IC。")
+        if panel.empty:
+            return {"ic": pd.DataFrame(), "summary": pd.DataFrame(), "quantiles": {},
+                    "coverage": pd.Series(dtype=float), "warnings": warnings}
     cov = coverage(panel)
     dead = [n for n, v in cov.items() if v < 0.2]
     if dead:

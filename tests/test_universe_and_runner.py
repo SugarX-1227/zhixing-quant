@@ -399,3 +399,32 @@ def test_build_universe_uses_historical_st_name(tmp_path, monkeypatch):
     assert "600001" not in now.codes
     assert "600002" in now.codes
     store.close()
+
+
+def test_mask_signals_by_breadth_drops_thin_days():
+    import pandas as pd
+
+    from zhixing_quant.backtest.runner import mask_signals_by_breadth
+
+    idx = pd.bdate_range("2024-01-02", periods=3)
+    data = {
+        "A": pd.DataFrame({"sig_b2": [True, True, False]}, index=idx),
+        "B": pd.DataFrame({"sig_b2": [True, False, True]}, index=idx),
+        "C": pd.DataFrame({"sig_b2": [True, False, True]}, index=idx),
+    }
+    # 三天的命中数分别是 3 / 1 / 2，门槛 2 只关掉第二天
+    out = mask_signals_by_breadth(data, "sig_b2", 2)
+    assert out["A"]["sig_b2"].tolist() == [True, False, False]
+    assert out["B"]["sig_b2"].tolist() == [True, False, True]
+    assert out["C"]["sig_b2"].tolist() == [True, False, True]
+    assert data["A"]["sig_b2"].tolist() == [True, True, False]      # 不改原数据
+
+
+def test_mask_signals_by_breadth_zero_is_noop():
+    import pandas as pd
+
+    from zhixing_quant.backtest.runner import mask_signals_by_breadth
+
+    idx = pd.bdate_range("2024-01-02", periods=2)
+    data = {"A": pd.DataFrame({"sig_b2": [True, False]}, index=idx)}
+    assert mask_signals_by_breadth(data, "sig_b2", 0) is data

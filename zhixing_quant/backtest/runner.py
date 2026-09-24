@@ -157,6 +157,11 @@ def run_backtest(
         )
 
     data = mask_signals_by_membership(data, sig_col, pools, end)
+    min_breadth = int((cfg.get(strategy, {}) or {}).get("min_breadth", 0) or 0)
+    if min_breadth > 0:
+        data = mask_signals_by_breadth(data, sig_col, min_breadth)
+        warnings.append(f"当天全池 {strategy} 命中少于 {min_breadth} 只的日子不开新仓"
+                        f"（{strategy}.min_breadth）。")
 
     # 活跃市值区间（择时）：BEAR 日引擎会禁止开仓并在开盘清仓。
     # regime_before 把收盘态平移到次日，保证无未来函数。
@@ -327,6 +332,43 @@ def mask_signals_by_membership(
             continue
         copied = df.copy()
         copied.loc[~eligible, sig_col] = False
+        out[code] = copied
+    return out
+
+
+def mask_signals_by_breadth(
+    data: Dict[str, pd.DataFrame],
+    sig_col: str,
+    min_count: int,
+) -> Dict[str, pd.DataFrame]:
+    """当天全池命中数少于 min_count 的日子，买入信号全部关掉。
+
+    2026-09 全量实测（B2，多头区间，阈值由样本内定）：当天全市场只有 ≤7 只
+    命中 B2 的日子，5 日超额样本内 -1.63%（t -2.9）、样本外 -2.08%（t -2.9）；
+    命中最多的一档约为零。命中数只用 T 日收盘后可知的信号计算，无未来函数。
+    选股侧（scanner/_core.py）按同一门槛处理，两边口径一致。
+    """
+    if not min_count or int(min_count) <= 0:
+        return data
+    counts = None
+    for df in data.values():
+        if sig_col in df.columns:
+            s = df[sig_col].fillna(False).astype(int)
+            counts = s if counts is None else counts.add(s, fill_value=0)
+    if counts is None:
+        return data
+    low = counts.index[counts < int(min_count)]
+    out: Dict[str, pd.DataFrame] = {}
+    for code, df in data.items():
+        if sig_col not in df.columns:
+            out[code] = df
+            continue
+        hit = df.index.isin(low) & df[sig_col].fillna(False).astype(bool).to_numpy()
+        if not hit.any():
+            out[code] = df
+            continue
+        copied = df.copy()
+        copied.loc[hit, sig_col] = False
         out[code] = copied
     return out
 

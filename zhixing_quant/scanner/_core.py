@@ -153,6 +153,20 @@ def scan(
     diag.extend(rank_warn)
 
     total_matches = len(df)
+    # 当天命中太少的日子不开新仓，与回测 runner.mask_signals_by_breadth 同口径。
+    # 只扫了前 N 只时命中数不代表全市场，不能拿来比门槛。
+    min_breadth = int((cfg.get(spec.key, {}) or {}).get("min_breadth", 0) or 0)
+    if min_breadth > 0:
+        if limit_universe:
+            diag.append(f"只扫了前 {limit_universe} 只，命中数不代表全市场，"
+                        f"未应用 {spec.key}.min_breadth 过滤。")
+        elif total_matches < min_breadth:
+            diag.append(f"今天全市场只有 {total_matches} 只命中，少于门槛 {min_breadth}："
+                        f"按规则今天不开新仓（回测同口径）。")
+            empty = _empty_candidates()
+            empty.attrs.update(total_matches=total_matches, scanned=total,
+                               warnings=diag, rank_note=rank_note, breadth_blocked=True)
+            return empty, {}
     df = df.head(max_candidates).reset_index(drop=True)
     # Keep the uncapped count available to the CLI/UI and self-check output.
     df.attrs["total_matches"] = total_matches

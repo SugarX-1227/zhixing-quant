@@ -54,10 +54,15 @@ data:
 启动 Web 服务：
 
 ```bash
-.venv/bin/streamlit run app.py
+.venv/bin/python -m zhixing_quant.web            # 默认只监听本机 127.0.0.1:8501
 ```
 
-浏览器打开 http://localhost:8501，七个页面：今日 / 持仓 / 战法 / 回测 / 因子 / 个股 / 数据。
+浏览器打开 http://localhost:8501，八个页面：今日 / 持仓 / 战法 / 回测 / 校准 / 因子 / 个股 / 数据。
+右上角切换账户（波段 / 超短）和浅色 / 深色主题。
+
+界面是 FastAPI JSON 接口 + 静态单页应用（`zhixing_quant/web/`）。扫描、回测、校准这类
+慢任务在后台线程里跑，页面显示进度；切到别的页面再回来，结果还在。
+接口文档在 http://localhost:8501/api/docs。
 
 ## 只读行情 MCP 服务（多机协作）
 
@@ -126,7 +131,7 @@ python -m zhixing_quant.mcp_server --http --host 0.0.0.0 --port 8765
 
 1. 收盘后打开通达信，等它下载完盘后数据（这一步你本来就在做）
 2. `python -m zhixing_quant.data.sync`
-3. `streamlit run app.py` → 选股页 → 开始扫描
+3. `python -m zhixing_quant.web` → 今日页 → 运行今日决策
 
 第 2 步可以自动化，`scripts/daily_sync.sh` 已经写好：
 
@@ -175,9 +180,9 @@ python -m zhixing_quant.scanner.daily_b1 --date 20250115 --limit-universe 300
 ## 目录结构
 
 ```
-app.py                      Web 服务入口（取代旧的 HTML 报告）
 config/settings.yaml        全部参数
 zhixing_quant/
+  web/                      Web 界面：server.py 接口 / tasks.py 后台任务 / static/ 前端
   data/                     ★ 本地行情数据层
     tdx_reader.py           通达信二进制文件解析
     store.py                SQLite 仓库 + 增量状态

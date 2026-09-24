@@ -1,7 +1,7 @@
 """砖型图每日选股。
 
 数据来自本地通达信文件（zhixing_quant.data），不再走 MCP。
-结果不落 HTML，直接看终端输出或 `streamlit run app.py`。
+结果不落 HTML，直接看终端输出或 Web 界面（`python -m zhixing_quant.web`）。
 
 选股条件来源：通达信行情指标与选股指标(1).md
     黄线 = (MA(C,14)+MA(C,28)+MA(C,57)+MA(C,114))/4

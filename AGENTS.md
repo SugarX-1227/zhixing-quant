@@ -16,7 +16,7 @@ data/market.db  (SQLite, 主键 code+trade_date)
         │
         ├─→ zhixing_quant/scanner/   选股
         ├─→ zhixing_quant/backtest/  回测
-        └─→ app.py                   Streamlit Web 界面
+        └─→ zhixing_quant/web/       Web 界面（FastAPI 接口 + 静态单页前端）
 ```
 
 必须知道的几件事：
@@ -234,8 +234,8 @@ python -m zhixing_quant.data.sync --full --names --xdxr
 python -m zhixing_quant.scanner.daily_brick
 python -m zhixing_quant.scanner.daily_b1 --date 20250115 --limit-universe 300
 
-# Web 界面
-streamlit run app.py
+# Web 界面（http://127.0.0.1:8501）
+python -m zhixing_quant.web
 
 # 测试
 python -m pytest -q

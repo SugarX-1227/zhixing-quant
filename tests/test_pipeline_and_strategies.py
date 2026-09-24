@@ -143,7 +143,7 @@ def test_strategy_meta_covers_all_strategies():
 
 def test_exit_reason_is_translated():
     """DefenseEngine 返回英文代号，界面上不该出现 stop_loss_hit。"""
-    from zhixing_quant.ui.components import exit_reason
+    from zhixing_quant.web.labels import exit_reason
 
     assert exit_reason("stop_loss_hit") == "触发止损位"
     assert exit_reason("yellow_break") == "跌破黄线"

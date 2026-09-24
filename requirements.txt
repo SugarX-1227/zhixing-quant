@@ -3,12 +3,14 @@ pandas==2.3.3
 numpy==2.1.3
 PyYAML==6.0.3
 
-# Web 服务
-streamlit==1.40.2
-plotly==5.24.1
+# Web 服务（前端是静态文件，ECharts / Preact 已内置在 zhixing_quant/web/static/vendor，
+# 不需要 Node，也不需要外网 CDN）
+fastapi==0.141.1
+uvicorn==0.53.0
 
 # 测试
 pytest==8.4.2
+httpx==0.28.1              # fastapi.testclient 依赖
 
 # 可选：只读行情 MCP 服务（zhixing_quant/mcp_server.py）。
 # 只在对外提供 MCP 服务的数据机那台需要装，另一台机器的客户端不需要。

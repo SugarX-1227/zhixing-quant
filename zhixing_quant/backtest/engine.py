@@ -123,6 +123,12 @@ class BacktestEngine:
         self.kelly_fraction = float(pcfg.get("kelly_fraction", 0.25))
         self.apply_regime_cap = bool(bt.get("apply_regime_cap", False))
 
+        # 核心仓：多头区间把闲置现金放进指数 ETF，个股要买时再卖 ETF 腾钱。
+        # ETF 免印花税和过户费，只收佣金（最低 5 元）和自己的滑点。
+        core = bt.get("core", {}) or {}
+        self.core_slippage = float(core.get("slippage", 0.0005))
+        self.core_min_trade_pct = float(core.get("min_trade_pct", 0.02))
+
     # -- 主循环 -----------------------------------------------------------
 
     def run(
@@ -138,6 +144,7 @@ class BacktestEngine:
         exit_policy=None,
         entry_spec=None,
         rank_scores=None,
+        core_prices: Optional[pd.DataFrame] = None,
     ) -> BacktestResult:
         """跑一次回测。
 
@@ -163,15 +170,20 @@ class BacktestEngine:
             regime: {"YYYY-MM-DD": "BULL"/"BEAR"/"NEUTRAL"}，各交易日开盘时可知的
                     活跃市值区间（由 T-1 及之前的活跃市值收盘决定，无未来函数）。
                     BEAR 日：禁止开新仓，已有持仓当日开盘强制清仓。
+            core_prices: 核心仓指数的日线（open/close，DatetimeIndex）。给了就在
+                    **当日开盘可知为 BULL** 的日子把闲置现金买成该指数（ETF 代理），
+                    个股买单现金不够时先卖核心仓；非多头日开盘清掉核心仓。
+                    price_data 为空时就是「只择时不选股」。
 
         Returns:
             BacktestResult
         """
-        if not price_data:
+        core = self._prepare_core(core_prices, start_date, end_date)
+        if not price_data and core is None:
             return BacktestResult(metrics=compute_metrics([], []))
 
-        prepared = self._prepare(price_data, signal_col, stop_col, start_date, end_date)
-        if not prepared:
+        prepared = self._prepare(price_data or {}, signal_col, stop_col, start_date, end_date)
+        if not prepared and core is None:
             return BacktestResult(metrics=compute_metrics([], []))
 
         if exit_policy is not None:
@@ -180,6 +192,8 @@ class BacktestEngine:
                 item["ef"] = ExitFrame(item["df"])
 
         calendar = self._build_calendar(prepared)
+        if core is not None:
+            calendar = sorted(set(calendar) | set(core))
         if len(calendar) < 2:
             return BacktestResult(metrics=compute_metrics([], []))
 
@@ -197,6 +211,12 @@ class BacktestEngine:
         # 分母。这是实盘也只能拿到的信息，不构成未来函数。
         last_equity = self.initial_capital
         last_held = 0.0
+        core_units = 0.0          # 核心仓持有的指数「份额」（按指数点位计价）
+        core_traded = 0.0         # 核心仓累计成交额
+        core_fees = 0.0
+        core_close = 0.0          # 核心仓最近一个收盘价（指数缺某天时沿用）
+        core_weights: List[float] = []
+        stock_weights: List[float] = []
 
         for day_i, date in enumerate(calendar):
             date_str = date.strftime("%Y-%m-%d")
@@ -232,6 +252,15 @@ class BacktestEngine:
                                         date_str, reason)
                 pending_exits.remove(code)
 
+            core_bar = core.get(date) if core is not None else None
+            core_on = core_bar is not None and regime_map.get(date_str, "NEUTRAL") == "BULL"
+            if core_bar is not None and not core_on and core_units > 0:
+                got, fee = self._core_sell(core_units, core_bar[0])
+                cash += got
+                core_traded += got + fee
+                core_fees += fee
+                core_units = 0.0
+
             for order in list(pending_entries):
                 code = order["code"]
                 held = positions.get(code)
@@ -249,6 +278,9 @@ class BacktestEngine:
                 if self._is_limit_up_open(prepared, code, date):
                     continue          # 一字涨停买不进
                 price = self._fill_price(bar["open"], "BUY")
+                # 核心仓随时可以卖掉腾钱，所以算股数时它也算「手头的钱」
+                spendable = cash + (self._core_sell(core_units, core_bar[0])[0]
+                                    if core_on and core_units > 0 else 0.0)
 
                 if scaling:
                     gain = price / held.entry_price - 1.0 if held.entry_price else 0.0
@@ -267,17 +299,24 @@ class BacktestEngine:
                         shares = self._pct_shares(entry_spec.base_pct, last_equity, price)
                     else:
                         shares = self._entry_shares(
-                            cash, positions, price, stop,
+                            spendable, positions, price, stop,
                             equity=last_equity, held_value=last_held,
                             regime=regime_map.get(date_str, "NEUTRAL"))
 
                 if shares <= 0:
                     continue
-                affordable = int(cash * 0.98 // (price * 100)) * 100
+                affordable = int(spendable * 0.98 // (price * 100)) * 100
                 shares = min(shares, affordable)
                 if shares <= 0:
                     continue
                 cost, _ = self._buy_cost(price, shares)
+                if cost > cash and core_on and core_units > 0:
+                    units = self._core_units_for(cost - cash, core_bar[0], core_units)
+                    got, fee = self._core_sell(units, core_bar[0])
+                    cash += got
+                    core_traded += got + fee
+                    core_fees += fee
+                    core_units -= units
                 if cost > cash:
                     continue
                 cash -= cost
@@ -305,6 +344,16 @@ class BacktestEngine:
                     highest_high=bar["high"],
                 )
             pending_entries = []
+
+            # 买完个股剩下的现金放进核心仓（留 1% 付费用，零碎的不折腾）
+            if core_on:
+                spare = cash - 0.01 * last_equity
+                if spare > self.core_min_trade_pct * last_equity:
+                    units, fee = self._core_buy(spare, core_bar[0])
+                    cash -= spare
+                    core_units += units
+                    core_traded += spare
+                    core_fees += fee
 
             # --- 2. 盘中：检查止损止盈（用当日 high/low 判定，成交价保守取触发价）---
             for code, pos in list(positions.items()):
@@ -362,6 +411,14 @@ class BacktestEngine:
                     pos.exit_reason = reason
                     pending_exits.append(code)
 
+            if core_bar is not None:
+                core_close = core_bar[1]
+            if core is not None:
+                core_value = core_units * core_close if core_units > 0 else 0.0
+                equity += core_value
+                core_weights.append(core_value / equity if equity > 0 else 0.0)
+                stock_weights.append(sum(p["market_value"] for p in snapshot) / equity
+                                     if equity > 0 else 0.0)
             equity_values.append(equity)
             last_equity = equity
             last_held = sum(p["market_value"] for p in snapshot)
@@ -393,6 +450,11 @@ class BacktestEngine:
         metrics["total_return"] = (
             round(equity_values[-1] / self.initial_capital - 1, 4) if equity_values else 0.0
         )
+        if core is not None:
+            metrics["core_turnover"] = round(core_traded / self.initial_capital, 2)
+            metrics["core_fees"] = round(core_fees, 2)
+            metrics["avg_core_weight"] = round(float(np.mean(core_weights)), 4) if core_weights else 0.0
+            metrics["avg_stock_weight"] = round(float(np.mean(stock_weights)), 4) if stock_weights else 0.0
         if regime_map:
             metrics["bear_regime_days"] = bear_days
             metrics["bear_forced_exits"] = sum(
@@ -431,6 +493,39 @@ class BacktestEngine:
                          else d["low"].to_numpy(float)),
             }
         return out
+
+    @staticmethod
+    def _prepare_core(core_prices, start_date, end_date) -> Optional[dict]:
+        """核心仓指数 → {日期: (开盘, 收盘)}。"""
+        if core_prices is None or core_prices.empty:
+            return None
+        d = core_prices
+        if start_date:
+            d = d[d.index >= pd.Timestamp(start_date)]
+        if end_date:
+            d = d[d.index <= pd.Timestamp(end_date)]
+        if d.empty:
+            return None
+        return dict(zip(d.index, zip(d["open"].to_numpy(float), d["close"].to_numpy(float))))
+
+    def _core_fee(self, value: float) -> float:
+        return max(value * self.commission, self.commission_min)
+
+    def _core_buy(self, value: float, price: float) -> tuple:
+        """花 value 现金买核心仓，返回 (份额, 费用)。"""
+        fee = self._core_fee(value)
+        return (value - fee) / (price * (1 + self.core_slippage)), fee
+
+    def _core_sell(self, units: float, price: float) -> tuple:
+        """卖出 units 份核心仓，返回 (到手现金, 费用)。"""
+        gross = units * price * (1 - self.core_slippage)
+        fee = self._core_fee(gross)
+        return gross - fee, fee
+
+    def _core_units_for(self, need: float, price: float, held: float) -> float:
+        """凑出 need 现金至少要卖多少份（多卖 0.5% 防费用算差），不超过持有量。"""
+        gross = (need + self.commission_min) / (1 - self.commission) * 1.005
+        return min(held, gross / (price * (1 - self.core_slippage)))
 
     @staticmethod
     def _build_calendar(prepared: dict) -> List[pd.Timestamp]:

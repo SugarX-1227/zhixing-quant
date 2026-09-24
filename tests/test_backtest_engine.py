@@ -211,3 +211,62 @@ def test_main_board_is_unaffected_by_the_reform_date():
 def test_limit_pct_without_a_date_assumes_current_rules():
     """不传日期时按现行规则，保持既有调用方的行为不变。"""
     assert BacktestEngine(CFG)._limit_pct("300750") == 0.20
+
+
+# ---------------------------------------------------------------------------
+# 核心仓：多头区间闲置现金持有指数 ETF，个股买单现金不够时先卖核心仓
+# ---------------------------------------------------------------------------
+
+def _core(n, start=100.0, step=0.01):
+    """每天开盘到收盘涨 step、收盘到次日开盘不动的指数。"""
+    idx = pd.DatetimeIndex(pd.date_range("2024-01-01", periods=n, freq="B"), name="date")
+    opens = start * (1 + step) ** np.arange(n)
+    return pd.DataFrame({"open": opens, "close": opens * (1 + step)}, index=idx)
+
+
+def _regimes(idx, bull_from, bear_from):
+    return {ts.strftime("%Y-%m-%d"): ("BEAR" if i >= bear_from else
+                                      "BULL" if i >= bull_from else "NEUTRAL")
+            for i, ts in enumerate(idx)}
+
+
+def test_timing_only_holds_core_in_bull_and_exits_in_bear():
+    """区间是开盘可知的：BULL 当天开盘买进，BEAR 当天开盘卖出，其余日子不动。"""
+    core = _core(10)
+    reg = _regimes(core.index, bull_from=2, bear_from=6)
+    res = BacktestEngine(CFG).run({}, regime=reg, core_prices=core)
+    eq = res.equity_curve
+    assert len(eq) == 10
+    assert eq.iloc[0] == eq.iloc[1] == 100000.0            # 未定区间空仓
+    assert eq.iloc[2] > 100000.0 * 1.009                   # 第一个多头日开盘买，赚当天开→收
+    assert eq.iloc[5] > eq.iloc[4] > eq.iloc[3] > eq.iloc[2]
+    assert eq.iloc[6:].nunique() == 1                      # 空头日开盘清仓后纹丝不动
+    assert res.metrics["total_trades"] == 0                # 核心仓不计入个股成交
+    assert 0.35 < res.metrics["avg_core_weight"] < 0.45    # 10 天里持有 4 天
+    assert res.metrics["core_fees"] >= 10                  # 买卖各至少 5 元
+
+
+def test_core_is_not_bought_outside_bull():
+    core = _core(8)
+    reg = _regimes(core.index, bull_from=99, bear_from=99)  # 全程 NEUTRAL
+    res = BacktestEngine(CFG).run({}, regime=reg, core_prices=core)
+    assert res.equity_curve.nunique() == 1
+    assert res.metrics["core_turnover"] == 0
+
+
+def test_stock_buy_is_funded_by_selling_core():
+    """现金全在核心仓里时，个股信号照样能买进，钱从核心仓里卖出来。"""
+    cfg = {**CFG, "backtest": {**CFG["backtest"], "sizing": "pct", "position_pct": 0.305}}
+    df = _frame([(10, 10.5, 9.5, 10)] * 10, sig_idx=[3])
+    core = _core(10, step=0.0)
+    reg = _regimes(df.index, bull_from=1, bear_from=99)
+    res = BacktestEngine(cfg).run({"600000": df}, signal_col="sig", regime=reg,
+                                  core_prices=core)
+    snap = {d["date"]: d for d in res.daily_positions}
+    day4 = df.index[4].strftime("%Y-%m-%d")                # idx3 收盘信号 → idx4 开盘买
+    held = snap[day4]["positions"]
+    assert held and held[0]["shares"] == 3000              # 30.5% × 权益（扣过核心仓费用）/ 10 元
+    assert snap[day4]["cash"] < 0.02 * 100000              # 剩下的钱又回到核心仓
+    # 第 0 天未定区间空仓，第 1 天起全程多头：除 1% 备付金外个股 + 核心仓满仓，
+    # 10 天平均 ≈ 9/10 × 0.99
+    assert res.metrics["avg_stock_weight"] + res.metrics["avg_core_weight"] > 0.88

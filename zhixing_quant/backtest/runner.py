@@ -25,6 +25,10 @@ BACKTESTABLE = {
     "b2": "sig_b2",
 }
 
+# 只择时不选股：多头区间持有核心仓指数（backtest.core.code），其余空仓。
+# 它没有信号列，不进 BACKTESTABLE（因子页、校准页都按信号列工作）。
+TIMING_ONLY = "timing"
+
 
 @dataclass
 class BacktestRun:
@@ -89,6 +93,10 @@ def run_backtest(
         get_store, load_daily_many, survivorship_warnings,
     )
     from zhixing_quant.indicators.pipeline import PIPELINES, run_steps
+
+    core_code = str(((cfg.get("backtest", {}) or {}).get("core", {}) or {}).get("code", "") or "")
+    if strategy == TIMING_ONLY:
+        return _run_timing_only(cfg, start, end, core_code, benchmark_code)
 
     sig_col = BACKTESTABLE.get(strategy)
     if sig_col is None:
@@ -185,10 +193,16 @@ def run_backtest(
     if rank_note:
         warnings.append(rank_note)
 
+    core_prices = _load_core(core_code, start, end) if core_code else None
+    if core_prices is not None:
+        warnings.append(f"核心仓：多头区间闲置现金持有 {core_code}（ETF 代理，"
+                        "价格指数不含分红，略偏保守）。")
+
     engine = BacktestEngine(cfg)
     result = engine.run(data, signal_col=sig_col, start_date=start, end_date=end,
                         regime=regime_map, exit_policy=exit_policy,
-                        entry_spec=entry_spec, rank_scores=rank_scores)
+                        entry_spec=entry_spec, rank_scores=rank_scores,
+                        core_prices=core_prices)
 
     warnings.extend(survivorship_warnings(get_store()))
 
@@ -235,6 +249,49 @@ def run_backtest(
         used_cfg=cfg,
     )
 
+
+
+def _load_core(code: str, start: str, end: str) -> pd.DataFrame:
+    """核心仓指数日线（不复权，指数没有除权）。只收指数代码，个股 6 位代码会撞车。"""
+    from zhixing_quant.data.tdx_loader import load_daily
+
+    if not code.startswith(("sh", "sz")):
+        raise ValueError(f"核心仓必须是带市场前缀的指数代码（如 sh000905），收到 {code}")
+    df = load_daily(code, start_date=start, end_date=end, adjust="")
+    if df is None or len(df) < 2:
+        raise ValueError(f"库里没有核心仓指数 {code} 在 {start}~{end} 的数据")
+    return df[["open", "close"]]
+
+
+def _run_timing_only(cfg: dict, start: str, end: str, core_code: str,
+                     benchmark_code: str) -> BacktestRun:
+    """只择时不选股：活跃市值多头持有指数，其余空仓。同一个引擎、同一套成本。"""
+    from zhixing_quant.backtest.engine import BacktestEngine
+    from zhixing_quant.timing.active_value import oamv_trigger_states, regime_before
+
+    if not core_code:
+        raise ValueError("只择时需要指定核心仓指数（backtest.core.code，如 sh000905）")
+    core_prices = _load_core(core_code, start, end)
+    states = oamv_trigger_states(cfg)
+    regime_map = regime_before(list(core_prices.index), states)
+    result = BacktestEngine(cfg).run({}, start_date=start, end_date=end,
+                                     regime=regime_map, core_prices=core_prices)
+    win = states[(states.trade_date >= int(start)) & (states.trade_date <= int(end))]
+    regime_log = win.loc[win.trigger != "", ["trade_date", "close", "pct",
+                                             "trigger", "regime"]]
+    bench, bench_used = _load_benchmark(benchmark_code, start, end, result.equity_curve)
+    warnings = [f"只择时：活跃市值多头区间持有 {core_code}（ETF 代理，价格指数不含分红），"
+                "空头与未定区间空仓。"]
+    if bench_used and bench_used != benchmark_code:
+        warnings.append(f"库里没有 {benchmark_code}，已改用 {bench_used} 作基准。")
+    return BacktestRun(
+        metrics=result.metrics, equity_curve=result.equity_curve,
+        trades=result.trades_frame(), benchmark=bench,
+        universe_note=f"只择时｜多头持有 {core_code}", warnings=warnings,
+        regime_log=regime_log.reset_index(drop=True),
+        exit_note="空头区间次日开盘清仓", entry_note="多头区间次日开盘满仓",
+        used_cfg=cfg,
+    )
 
 
 def build_rank_scores(cfg: dict, strategy: str, data: Dict[str, pd.DataFrame]

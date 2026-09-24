@@ -315,16 +315,17 @@ def _list_and_chart(cands: pd.DataFrame, charts: dict, key: str):
 # ---------------------------------------------------------------------------
 
 def page_backtest(cfg, book):
-    from zhixing_quant.backtest.runner import BACKTESTABLE
+    from zhixing_quant.backtest.runner import BACKTESTABLE, TIMING_ONLY
     from zhixing_quant.data.universe import BOARDS, UniverseSpec
 
     C.page_head("回测", "T 日收盘出信号，T+1 开盘成交")
     strategies = _strategies()
-    names = [n for n in strategies if n in BACKTESTABLE]
+    names = [n for n in strategies if n in BACKTESTABLE] + [TIMING_ONLY]
     blocked = [strategies[n]["label"] for n in strategies if n not in BACKTESTABLE]
 
     c = st.columns([2, 1.4, 1.4, 1])
-    name = c[0].selectbox("战法", names, format_func=lambda n: strategies[n]["label"])
+    name = c[0].selectbox("战法", names, format_func=lambda n: (
+        "只择时（不选股，多头持有指数）" if n == TIMING_ONLY else strategies[n]["label"]))
     start = c[1].date_input("开始", value=datetime.now() - timedelta(days=730))
     end = c[2].date_input("结束", value=datetime.now())
     c[3].write("")
@@ -333,6 +334,20 @@ def page_backtest(cfg, book):
     if blocked:
         st.caption(f"暂不支持回测：{'、'.join(blocked)}"
                    "（信号需逐根K线求值，引擎读的是预算好的信号列）")
+
+    # 核心仓：多头区间把个股没用到的现金放进指数 ETF（backtest.core.code）
+    core_names = {"sh000905": "中证500", "sh000852": "中证1000",
+                  "sh000300": "沪深300", "sz399006": "创业板指"}
+    core_keys = ([] if name == TIMING_ONLY else [""]) + list(core_names)
+    cur_core = str(PS.get_value(cfg, "backtest.core.code", "") or "")
+    if cur_core not in core_keys:
+        cur_core = core_keys[0]
+    core_code = st.selectbox(
+        "核心仓：多头区间闲置现金买哪个指数（ETF 代理）", core_keys,
+        index=core_keys.index(cur_core),
+        format_func=lambda k: core_names.get(k, "不用（闲置现金留着）"),
+        help="个股要买时先卖核心仓腾钱，非多头日开盘清掉。对应「牛市区间保持仓位」。"
+             "ETF 按佣金 + 0.05% 滑点记账，免印花税。")
 
     tabs = st.tabs(["股票池", "战法参数", "出场规则", "交易规则", "成本与风控"])
 
@@ -392,7 +407,7 @@ def page_backtest(cfg, book):
 
     if go:
         from zhixing_quant.backtest.runner import run_backtest
-        local = PS.apply_overrides(cfg, overrides)
+        local = PS.apply_overrides(cfg, {**overrides, "backtest.core.code": core_code})
         bar = st.progress(0.0, text="准备数据...")
         try:
             run = run_backtest(local, name, start.strftime("%Y%m%d"),
@@ -417,12 +432,17 @@ def page_backtest(cfg, book):
     run, changed = got
     for w in run.warnings:
         st.warning(w)
-    st.caption(f"股票池：{run.universe_note}　|　实际回测 {run.loaded} 只"
+    st.caption(f"股票池：{run.universe_note}"
+               + (f"　|　实际回测 {run.loaded} 只" if run.loaded else "")
                + (f"，跳过 {run.skipped} 只（K线不足）" if run.skipped else ""))
     if getattr(run, "entry_note", ""):
         st.caption(f"建仓规则：{run.entry_note}")
     if getattr(run, "exit_note", ""):
         st.caption(f"出场规则：{run.exit_note}")
+    m0 = run.metrics
+    if "avg_core_weight" in m0:
+        st.caption(f"平均仓位：个股 {m0['avg_stock_weight']:.0%}，核心仓 {m0['avg_core_weight']:.0%}"
+                   f"　|　核心仓累计成交 {m0['core_turnover']:.1f} 倍本金，费用 {m0['core_fees']:,.0f} 元")
     if changed:
         st.caption("改动的参数：" + "、".join(f"`{k}`={v}" for k, v in changed.items()))
 
@@ -474,52 +494,54 @@ def page_backtest(cfg, book):
         right.dataframe(counts.rename("笔数"), use_container_width=True)
 
     # ---- 出场规则消融：逐条关掉，看每条各自贡献多少 ----
-    C.section("出场规则消融", "规则叠多了靠直觉判断不出哪条有用，逐条关掉实测",
-              f"当前启用 {len(_active_switches(local_cfg_of(run), name))} 条")
-    st.caption("保持其余规则不变，只关掉一条重跑。关掉后收益**变高** = 这条在亏钱；"
-               "**变低** = 这条在赚钱；**不变** = 从未触发，是摆设。"
-               "⚠️ 这是诊断工具，不是调参工具——在同一段历史上反复删规则留下最好看的"
-               "组合就是在拟合噪声，删之前先在样本外确认。")
-    ab1, ab2 = st.columns([1.4, 4])
-    mode = ab1.radio("视角", ["逐一关掉", "逐一只开"], horizontal=True,
-                     key="ab_mode",
-                     help="两种视角一起看：两条规则能救同一笔单子时，"
-                          "各自的「关掉」影响都会显得很小，但「只开」能看出真实效果")
-    if ab2.button(f"跑消融（要跑 N+1 次回测，比单次慢很多）", key="ab_go"):
-        from zhixing_quant.backtest.ablation import ablate_exits
-        bar = st.progress(0.0, text="准备...")
-        try:
-            table = ablate_exits(
-                local_cfg_of(run), name, start.strftime("%Y%m%d"),
-                end.strftime("%Y%m%d"), spec=spec,
-                universe_as_of=start.strftime("%Y%m%d"),
-                only_one=(mode == "逐一只开"),
-                progress=lambda d, t, n: bar.progress(min(d / max(t, 1), 1.0),
-                                                      text=f"{d}/{t} {n}"))
-        except Exception as exc:
-            bar.empty()
-            st.error(f"消融失败：{exc}")
-            table = None
-        else:
-            bar.empty()
-            st.session_state["ablation"] = table
+    # 只择时没有个股出场规则，消融无从谈起
+    if name != TIMING_ONLY:
+        C.section("出场规则消融", "规则叠多了靠直觉判断不出哪条有用，逐条关掉实测",
+                  f"当前启用 {len(_active_switches(local_cfg_of(run), name))} 条")
+        st.caption("保持其余规则不变，只关掉一条重跑。关掉后收益**变高** = 这条在亏钱；"
+                   "**变低** = 这条在赚钱；**不变** = 从未触发，是摆设。"
+                   "⚠️ 这是诊断工具，不是调参工具——在同一段历史上反复删规则留下最好看的"
+                   "组合就是在拟合噪声，删之前先在样本外确认。")
+        ab1, ab2 = st.columns([1.4, 4])
+        mode = ab1.radio("视角", ["逐一关掉", "逐一只开"], horizontal=True,
+                         key="ab_mode",
+                         help="两种视角一起看：两条规则能救同一笔单子时，"
+                              "各自的「关掉」影响都会显得很小，但「只开」能看出真实效果")
+        if ab2.button(f"跑消融（要跑 N+1 次回测，比单次慢很多）", key="ab_go"):
+            from zhixing_quant.backtest.ablation import ablate_exits
+            bar = st.progress(0.0, text="准备...")
+            try:
+                table = ablate_exits(
+                    local_cfg_of(run), name, start.strftime("%Y%m%d"),
+                    end.strftime("%Y%m%d"), spec=spec,
+                    universe_as_of=start.strftime("%Y%m%d"),
+                    only_one=(mode == "逐一只开"),
+                    progress=lambda d, t, n: bar.progress(min(d / max(t, 1), 1.0),
+                                                          text=f"{d}/{t} {n}"))
+            except Exception as exc:
+                bar.empty()
+                st.error(f"消融失败：{exc}")
+                table = None
+            else:
+                bar.empty()
+                st.session_state["ablation"] = table
 
-    table = st.session_state.get("ablation")
-    if table is not None and not table.empty:
-        from zhixing_quant.backtest.ablation import summarize
-        for line in summarize(table):
-            st.info(line)
-        view = table[["规则", "总收益", "最大回撤", "夏普", "胜率", "笔数",
-                      "Δ总收益", "Δ最大回撤", "Δ笔数", "判定"]]
-        st.dataframe(view, use_container_width=True, hide_index=True,
-                     column_config={
-                         "总收益": st.column_config.NumberColumn(format="%.2%"),
-                         "最大回撤": st.column_config.NumberColumn(format="%.2%"),
-                         "胜率": st.column_config.NumberColumn(format="%.1%"),
-                         "夏普": st.column_config.NumberColumn(format="%.2f"),
-                         "Δ总收益": st.column_config.NumberColumn(format="%.2%"),
-                         "Δ最大回撤": st.column_config.NumberColumn(format="%.2%"),
-                     })
+        table = st.session_state.get("ablation")
+        if table is not None and not table.empty:
+            from zhixing_quant.backtest.ablation import summarize
+            for line in summarize(table):
+                st.info(line)
+            view = table[["规则", "总收益", "最大回撤", "夏普", "胜率", "笔数",
+                          "Δ总收益", "Δ最大回撤", "Δ笔数", "判定"]]
+            st.dataframe(view, use_container_width=True, hide_index=True,
+                         column_config={
+                             "总收益": st.column_config.NumberColumn(format="%.2%"),
+                             "最大回撤": st.column_config.NumberColumn(format="%.2%"),
+                             "胜率": st.column_config.NumberColumn(format="%.1%"),
+                             "夏普": st.column_config.NumberColumn(format="%.2f"),
+                             "Δ总收益": st.column_config.NumberColumn(format="%.2%"),
+                             "Δ最大回撤": st.column_config.NumberColumn(format="%.2%"),
+                         })
 
     # 活跃市值区间触发日志（空头=-2.3%，多头=单日+4%或三日连涨和>4%）
     regime_log = getattr(run, "regime_log", None)

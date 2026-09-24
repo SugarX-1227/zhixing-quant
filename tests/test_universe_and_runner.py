@@ -428,3 +428,42 @@ def test_mask_signals_by_breadth_zero_is_noop():
     idx = pd.bdate_range("2024-01-02", periods=2)
     data = {"A": pd.DataFrame({"sig_b2": [True, False]}, index=idx)}
     assert mask_signals_by_breadth(data, "sig_b2", 0) is data
+
+
+def test_timing_only_runs_through_the_engine(monkeypatch):
+    """只择时：不建池、不算指标，多头区间持有核心仓指数，同一个引擎记账。"""
+    import numpy as np
+    import pandas as pd
+    import zhixing_quant.backtest.runner as runner
+    import zhixing_quant.timing.active_value as av
+
+    idx = pd.date_range("2024-01-01", periods=12, freq="B")
+    opens = 100 * 1.01 ** np.arange(12)
+    core = pd.DataFrame({"open": opens, "close": opens * 1.01}, index=idx)
+    states = pd.DataFrame({
+        "trade_date": [int(d.strftime("%Y%m%d")) for d in idx],
+        "close": 1.0, "pct": 0.0,
+        "trigger": [""] * 2 + ["bull_surge"] + [""] * 9,
+        "regime": ["NEUTRAL"] * 2 + ["BULL"] * 10,
+    })
+    monkeypatch.setattr(runner, "_load_core", lambda code, s, e: core)
+    monkeypatch.setattr(runner, "_load_benchmark", lambda *a: (None, None))
+    monkeypatch.setattr(runner, "build_universe",
+                        lambda *a, **k: pytest.fail("只择时不该建池"))
+    monkeypatch.setattr(av, "oamv_trigger_states", lambda cfg=None: states)
+
+    cfg = {"backtest": {"initial_capital": 100000, "core": {"code": "sh000905"}}}
+    run = runner.run_backtest(cfg, runner.TIMING_ONLY, "20240101", "20240116")
+    eq = run.equity_curve
+    assert eq.iloc[2] == 100000.0            # idx2 收盘才转多，idx3 开盘才买
+    assert eq.iloc[-1] > 100000 * 1.08       # 之后 9 天每天 +1%
+    assert run.metrics["total_trades"] == 0
+    assert len(run.regime_log) == 1
+
+
+def test_timing_only_requires_an_index_code():
+    from zhixing_quant.backtest import runner
+    with pytest.raises(ValueError, match="核心仓"):
+        runner.run_backtest({}, runner.TIMING_ONLY, "20240101", "20241231")
+    with pytest.raises(ValueError, match="指数代码"):
+        runner._load_core("000905", "20240101", "20241231")   # 6 位会撞个股
